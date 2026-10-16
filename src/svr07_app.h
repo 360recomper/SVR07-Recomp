@@ -5,7 +5,13 @@
 
 #pragma once
 
+#include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/rex_app.h>
+#include <rex/system/gpu_plugin.h>
+
+REXCVAR_DEFINE_STRING(gpu_backend, "vulkan", "GPU",
+                      "Graphics backend: vulkan (recommended) or d3d12 (skinned-model glitches)");
 
 class Svr07App : public rex::ReXApp {
  public:
@@ -18,12 +24,24 @@ class Svr07App : public rex::ReXApp {
   }
 
    void OnConfigurePaths(rex::PathConfig& paths) override {
-    // Keep the normal game mount.
-    // paths.game_data_root already points to your assets folder.
+    // SDK v0.10 no longer defaults the game mount; use the assets folder next
+    // to the exe (the release layout) unless --game_data_root was given.
+    if (paths.game_data_root.empty()) {
+      auto assets_dir = rex::filesystem::GetExecutableFolder() / "assets";
+      if (std::filesystem::is_directory(assets_dir)) {
+        paths.game_data_root = assets_dir;
+      }
+    }
 
     // Point UPDATE: to a separate folder containing the title update files.
-    paths.update_data_root =
-        std::filesystem::path(R"(\assets\1_update)");
+    // Relative to the game data root; a leading backslash would resolve to
+    // the root of the current drive instead.
+    if (paths.update_data_root.empty()) {
+      auto update_dir = paths.game_data_root / "1_update";
+      if (std::filesystem::is_directory(update_dir)) {
+        paths.update_data_root = update_dir;
+      }
+    }
 
     // Optional: point cache to a custom directory.
     // paths.cache_data_root =
@@ -33,8 +51,19 @@ class Svr07App : public rex::ReXApp {
     // paths.user_data_root = std::filesystem::path(R"(path\to\your\user\data)");
   }
 
+  void OnPreSetup(rex::RuntimeConfig& config) override {
+    // SDK v0.10 moved Xenos GPU emulation into the runtime-loaded rexgpu-xenos
+    // plugin, and an empty gpu_plugin cvar means no GPU at all.
+    if (!config.graphics) {
+      config.graphics = rex::system::LoadGpuPlugin("xenos", REXCVAR_GET(gpu_backend));
+      if (!config.graphics) {
+        // Let ReXApp retry with any backend and show its fatal dialog on failure.
+        config.gpu_plugin = "xenos";
+      }
+    }
+  }
+
   // Override virtual hooks for customization:
-  // void OnPreSetup(rex::RuntimeConfig& config) override {}
   // void OnLoadXexImage(std::string& xex_image) override {}
   // void OnPostSetup() override {}
   // void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {}

@@ -28,3 +28,7 @@ out/**/*.pdb
 # Visual Studio user-specific files
 *.user
 *.suo
+
+# codegen build bookkeeping
+generated/default/*.stamp
+generated/default/*.d

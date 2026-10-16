@@ -1,0 +1,8 @@
+# Functions the v0.7.3 analyzer split out but v0.10 merges into their neighbour.
+# They are reached by indirect calls (e.g. 0x8242C948 at boot: 'Call to invalid
+# or unregistered function'), so they must be standalone entry points.
+[functions]
+0x8226DAA8 = { name = "sub_8226DAA8" }
+0x822EDBA0 = { name = "sub_822EDBA0" }
+0x8242C948 = { name = "sub_8242C948" }
+0x8242CB20 = { name = "sub_8242CB20" }

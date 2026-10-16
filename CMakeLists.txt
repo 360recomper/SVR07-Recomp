@@ -17,4 +17,4 @@ else()
   add_executable(svr07 ${SVR07_SOURCES})
 endif()
 
-rexglue_setup_target(svr07)
+rexglue_setup_target(svr07 GPU_PLUGINS xenos)

@@ -1,0 +1,18 @@
+[project]
+name = "svr07"
+sdk_version = "0.10.0"
+game_root = "assets"
+
+[entrypoint]
+file_path = "assets/default.xex"
+out_directory_path = "generated/default"
+includes = [
+  "config/functions.toml",
+  "config/v010_seeds.toml",
+]
+# CRT setjmp/longjmp (jmp_buf: f14-f31 @0, r1 @144, r13-r31 @152, CR @304, LR @308).
+# Without these, setjmp's register-saving body is never recompiled (the analyzer
+# stops at its bnectr hook check, so it saves nothing and returns non-zero) and
+# longjmp returns into the wrong host frame.
+setjmp_address = 0x82709E90
+longjmp_address = 0x82709D70
