@@ -9,6 +9,7 @@ include(generated/rexglue.cmake)
 
 set(SVR07_SOURCES
   src/main.cpp
+  src/svr07_hooks.cpp
 )
 
 if(WIN32)
