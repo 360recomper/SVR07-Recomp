@@ -32,3 +32,6 @@ out/**/*.pdb
 # codegen build bookkeeping
 generated/default/*.stamp
 generated/default/*.d
+
+# Recompiled game code: generated locally by `rexglue codegen svr07_manifest.toml`, never committed.
+/generated/default/
