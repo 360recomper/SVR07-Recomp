@@ -1,0 +1,1863 @@
+diff --git a/include/rex/audio/audio_driver.h b/include/rex/audio/audio_driver.h
+index 37ccbf2..269003e 100644
+--- a/include/rex/audio/audio_driver.h
++++ b/include/rex/audio/audio_driver.h
+@@ -11,11 +11,17 @@
+ 
+ #pragma once
+ 
++#include <atomic>
++
+ #include <rex/kernel.h>
+ #include <rex/memory.h>
+ 
+ namespace rex::audio {
+ 
++/// Set by the app (e.g. on window focus loss) to silence output without
++/// stopping the guest audio thread.
++inline std::atomic<bool> g_audio_muted{false};
++
+ class AudioDriver {
+  public:
+   explicit AudioDriver(memory::Memory* memory);
+diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
+index 4d85a2b..b7a77c8 100644
+--- a/include/rex/graphics/shared_memory.h
++++ b/include/rex/graphics/shared_memory.h
+@@ -174,6 +174,12 @@ class SharedMemory {
+   std::vector<uint64_t> system_page_flags_valid_;
+   // Subset of valid pages containing data written by the GPU.
+   std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
++  // gpu_verify_shared_memory debug state.
++  std::vector<uint64_t> debug_page_hashes_;
++  uint64_t debug_stale_page_count_ = 0;
++  std::vector<int64_t> debug_page_upload_time_;
++  uint64_t debug_late_write_count_ = 0;
++  void VerifyValidPages(const std::vector<std::pair<uint32_t, uint32_t>>& ranges);
+   uint32_t num_system_page_flags_ = 0;
+ 
+   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
+diff --git a/include/rex/input/input_system.h b/include/rex/input/input_system.h
+index 1cb3faa..809a2b5 100644
+--- a/include/rex/input/input_system.h
++++ b/include/rex/input/input_system.h
+@@ -10,6 +10,8 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
++#include <functional>
+ #include <memory>
+ #include <vector>
+ 
+@@ -25,6 +27,9 @@ class Window;
+ 
+ namespace rex::input {
+ 
++/// Set by the app (e.g. on window focus loss) to hide the pad from the game.
++inline std::atomic<bool> g_input_blocked{false};
++
+ class InputSystem : public system::IInputSystem {
+  public:
+   explicit InputSystem(rex::ui::Window* window);
+@@ -38,6 +43,9 @@ class InputSystem : public system::IInputSystem {
+   void AddDriver(std::unique_ptr<InputDriver> driver);
+   void AttachWindow(rex::ui::Window* window);
+   void SetActiveCallback(std::function<bool()> callback);
++  /// Called from GetState (user 0) with the merged pad. Return true to hide
++  /// the pad from the game (state is zeroed), e.g. while an overlay owns it.
++  void SetPadHook(std::function<bool(const X_INPUT_GAMEPAD&)> hook);
+ 
+   /// Replaces any previous assignment. Call before the guest starts polling.
+   void SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignment);
+@@ -55,6 +63,7 @@ class InputSystem : public system::IInputSystem {
+   const DeviceInfo* DeviceInfoFor(DeviceId id) const;
+ 
+   rex::ui::Window* window_ = nullptr;
++  std::function<bool(const X_INPUT_GAMEPAD&)> pad_hook_;
+ 
+   std::vector<std::unique_ptr<InputDriver>> drivers_;
+ 
+diff --git a/include/rex/rex_app.h b/include/rex/rex_app.h
+index 1f52480..6e2abf7 100644
+--- a/include/rex/rex_app.h
++++ b/include/rex/rex_app.h
+@@ -298,6 +298,8 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
+   std::unique_ptr<ui::Window> window_;
+   std::thread module_thread_;
+   std::atomic<bool> shutting_down_{false};
++  std::atomic<bool> pad_combo_down_{false};
++  std::function<void()> toggle_settings_;
+   std::unique_ptr<ui::ImmediateDrawer> immediate_drawer_;
+   std::unique_ptr<ui::ImGuiDrawer> imgui_drawer_;
+ 
+diff --git a/include/rex/system/info/file.h b/include/rex/system/info/file.h
+index ef0a9ad..3c133dc 100644
+--- a/include/rex/system/info/file.h
++++ b/include/rex/system/info/file.h
+@@ -65,7 +65,8 @@ struct X_FILE_BASIC_INFORMATION {
+   be<uint64_t> last_access_time;
+   be<uint64_t> last_write_time;
+   be<uint64_t> change_time;
+-  be<uint64_t> attributes;
++  be<uint32_t> attributes;  // ULONG FileAttributes
++  be<uint32_t> padding;
+ };
+ static_assert_size(X_FILE_BASIC_INFORMATION, 0x28);
+ 
+diff --git a/include/rex/ui/imgui_dialog.h b/include/rex/ui/imgui_dialog.h
+index a7ab6b3..8143250 100644
+--- a/include/rex/ui/imgui_dialog.h
++++ b/include/rex/ui/imgui_dialog.h
+@@ -39,6 +39,10 @@ class ImGuiDialog {
+ 
+   void Draw();
+ 
++  // SVR07: an idle dialog (e.g. an empty notification queue) does not need the
++  // UI to be repainted continuously at the monitor refresh rate.
++  virtual bool IsIdle() { return false; }
++
+  protected:
+   ImGuiDialog(ImGuiDrawer* imgui_drawer);
+ 
+diff --git a/include/rex/ui/imgui_drawer.h b/include/rex/ui/imgui_drawer.h
+index a570fa0..983fe09 100644
+--- a/include/rex/ui/imgui_drawer.h
++++ b/include/rex/ui/imgui_drawer.h
+@@ -12,6 +12,7 @@
+ #ifndef REX_UI_IMGUI_DRAWER_H_
+ #define REX_UI_IMGUI_DRAWER_H_
+ 
++#include <atomic>
+ #include <cstddef>
+ #include <cstdint>
+ #include <functional>
+@@ -40,6 +41,9 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
+   ~ImGuiDrawer();
+ 
+   ImGuiIO& GetIO();
++  // Latest pad state for ImGui navigation (thread-safe; call from any thread).
++  // active=false releases all pad keys and turns pad navigation off.
++  void SetGamepadInput(bool active, uint16_t buttons, int16_t lx, int16_t ly);
+ 
+   // Per-overlay styling, patched by the consumer in OnConfigureStyle.
+   Style& style() { return style_; }
+@@ -76,6 +80,10 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
+ 
+  private:
+   void Initialize();
++  void ApplyGamepadInput(ImGuiIO& io);
++  std::atomic<uint64_t> gamepad_packed_{0};  // bit 63 = active
++  uint16_t gamepad_prev_buttons_ = 0;
++  bool gamepad_prev_active_ = false;
+ 
+   void SetupFontTexture();
+ 
+diff --git a/include/rex/ui/overlay/achievement_toast.h b/include/rex/ui/overlay/achievement_toast.h
+index 7642601..135d7a5 100644
+--- a/include/rex/ui/overlay/achievement_toast.h
++++ b/include/rex/ui/overlay/achievement_toast.h
+@@ -35,6 +35,8 @@ class AchievementToastDialog : public AchievementNotificationDialog {
+   // Thread-safe: safe to call from any thread, including guest threads.
+   void Push(const rex::system::AchievementEvent& event) override;
+ 
++  bool IsIdle() override;
++
+  protected:
+   void OnDraw(ImGuiIO& io) override;
+ 
+diff --git a/include/rex/ui/overlay/settings_overlay.h b/include/rex/ui/overlay/settings_overlay.h
+index 5b80eac..61232f3 100644
+--- a/include/rex/ui/overlay/settings_overlay.h
++++ b/include/rex/ui/overlay/settings_overlay.h
+@@ -11,6 +11,7 @@
+  */
+ #pragma once
+ #include <filesystem>
++#include <functional>
+ #include <string>
+ #include <rex/ui/imgui_dialog.h>
+ 
+@@ -19,14 +20,32 @@ namespace rex::ui {
+ class SettingsDialog : public ImGuiDialog {
+  public:
+   // config_path: where "Save to config" writes (e.g. exe_dir / "app.toml")
+-  SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path);
++  // on_quit: "Quit game" button (hidden when empty). set_fullscreen/is_fullscreen: live toggle.
++  SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path,
++                 std::function<void()> on_quit = {}, std::function<void(bool)> set_fullscreen = {},
++                 std::function<bool()> is_fullscreen = {});
+   ~SettingsDialog();
+ 
++  // Called when the pad's B button (or Escape) is pressed with no popup open.
++  void set_on_close(std::function<void()> fn) { on_close_ = std::move(fn); }
++  // Folder holding the saves, for the backup / restore buttons.
++  void set_saves_dir(std::filesystem::path dir) { saves_dir_ = std::move(dir); }
++
+  protected:
+   void OnDraw(ImGuiIO& io) override;
+ 
+  private:
++  void DrawQuickSettings();
++
+   std::filesystem::path config_path_;
++  std::function<void()> on_quit_;
++  std::function<void(bool)> set_fullscreen_;
++  std::function<bool()> is_fullscreen_;
++  std::function<void()> on_close_;
++  std::filesystem::path saves_dir_;
++  bool popup_open_prev_ = false;
++  bool confirm_restore_ = false;
++  std::string save_status_;
+   char search_buf_[128] = {};
+   std::string selected_category_;
+   std::string capturing_bind_name_;
+diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
+index 20a2cd8..924b0c4 100644
+--- a/src/audio/sdl/sdl_audio_driver.cpp
++++ b/src/audio/sdl/sdl_audio_driver.cpp
+@@ -123,6 +123,8 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+   }
+ 
+   std::memcpy(output_frame, input_frame, frame_samples_ * sizeof(float));
++  if (g_audio_muted.load(std::memory_order_relaxed))
++    std::memset(output_frame, 0, frame_samples_ * sizeof(float));
+ 
+   static uint32_t sdl_submit_count = 0;
+   if (sdl_submit_count < 10) {
+diff --git a/src/codegen/builders/vector.cpp b/src/codegen/builders/vector.cpp
+index cbdd7f7..acff5b8 100644
+--- a/src/codegen/builders/vector.cpp
++++ b/src/codegen/builders/vector.cpp
+@@ -184,22 +184,37 @@ bool build_vlogefp(BuilderContext& ctx) {
+ //=============================================================================
+ 
+ bool build_vmsum3fp128(BuilderContext& ctx) {
+-  // 3-element dot product accounting for guest->host vector element reversal
+-  // 0xEF = dot(yzw) with result broadcast to all elements (see constants doc)
++  // Dot product with broadcast. Hardware returns QNaN when a dot of finite inputs overflows
++  // (rexglue-sdk#491), while SSE gives +/-inf.
+   ctx.emit_set_flush_mode(true);
+   ctx.println(
+-      "\tsimde_mm_store_ps({}.f32, simde_mm_dp_ps(simde_mm_load_ps({}.f32), "
+-      "simde_mm_load_ps({}.f32), 0xEF));",
++      "	{{ simde__m128 _a = simde_mm_load_ps({1}.f32), _b = simde_mm_load_ps({2}.f32); "
++      "simde__m128 _dp = simde_mm_dp_ps(_a, _b, 0xEF); "
++      "simde__m128 _sg = simde_mm_set1_ps(-0.0f), _inf = simde_mm_set1_ps(INFINITY); "
++      "simde__m128 _fin = simde_mm_and_ps(simde_mm_cmplt_ps(simde_mm_andnot_ps(_sg, _a), _inf), "
++      "simde_mm_cmplt_ps(simde_mm_andnot_ps(_sg, _b), _inf)); "
++      "if (simde_mm_movemask_ps(_fin) == 0xF && "
++      "simde_mm_movemask_ps(simde_mm_cmpeq_ps(simde_mm_andnot_ps(_sg, _dp), _inf)) != 0) "
++      "_dp = simde_mm_set1_ps(__builtin_nanf(\"\")); "
++      "simde_mm_store_ps({0}.f32, _dp); }}",
+       ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]));
+   return true;
+ }
+ 
+ bool build_vmsum4fp128(BuilderContext& ctx) {
+-  // 4-element dot product: 0xFF = all 4 elements, result to all (see constants doc)
++  // Dot product with broadcast. Hardware returns QNaN when a dot of finite inputs overflows
++  // (rexglue-sdk#491), while SSE gives +/-inf.
+   ctx.emit_set_flush_mode(true);
+   ctx.println(
+-      "\tsimde_mm_store_ps({}.f32, simde_mm_dp_ps(simde_mm_load_ps({}.f32), "
+-      "simde_mm_load_ps({}.f32), 0xFF));",
++      "	{{ simde__m128 _a = simde_mm_load_ps({1}.f32), _b = simde_mm_load_ps({2}.f32); "
++      "simde__m128 _dp = simde_mm_dp_ps(_a, _b, 0xFF); "
++      "simde__m128 _sg = simde_mm_set1_ps(-0.0f), _inf = simde_mm_set1_ps(INFINITY); "
++      "simde__m128 _fin = simde_mm_and_ps(simde_mm_cmplt_ps(simde_mm_andnot_ps(_sg, _a), _inf), "
++      "simde_mm_cmplt_ps(simde_mm_andnot_ps(_sg, _b), _inf)); "
++      "if (simde_mm_movemask_ps(_fin) == 0xF && "
++      "simde_mm_movemask_ps(simde_mm_cmpeq_ps(simde_mm_andnot_ps(_sg, _dp), _inf)) != 0) "
++      "_dp = simde_mm_set1_ps(__builtin_nanf(\"\")); "
++      "simde_mm_store_ps({0}.f32, _dp); }}",
+       ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]));
+   return true;
+ }
+@@ -1278,29 +1293,29 @@ bool build_vpkd3d128(BuilderContext& ctx) {
+ 
+     case 3:  // FLOAT16_2 - pack 2 floats to 2 float16s
+     {
+-      // Pack 2 elements into 32 bits (1 word)
+-      // Guest element 0 goes to high 16 bits, element 1 to low 16 bits
+-      // Output u16 index = (1-i) + 2*shift for element i
++      // Snapshot the source first: vD may alias vB (in-place pack), and writing the destination
++      // halfwords would otherwise corrupt source words that are read later (rexglue-sdk#457).
++      ctx.println("	{{ const uint32_t _vpks[4] = {{{0}.u32[0], {0}.u32[1], {0}.u32[2], {0}.u32[3]}};",
++                  ctx.v(ctx.insn.operands[1]));
+       for (size_t i = 0; i < 2; i++) {
+         size_t srcIdx = 3 - i;  // Guest element i is at host array index 3-i
+-        size_t dstIdx =
+-            (1 - i) + (2 * ctx.insn.operands[4]);  // Output reversed: elem 0 to high, elem 1 to low
+-        ctx.println("\t{}.u32 = ({}.u32[{}]&0x7FFFFFFF);", ctx.temp(), ctx.v(ctx.insn.operands[1]),
+-                    srcIdx);
++        size_t dstIdx = (1 - i) + (2 * ctx.insn.operands[4]);
++        ctx.println("	{}.u32 = (_vpks[{}]&0x7FFFFFFF);", ctx.temp(), srcIdx);
+         ctx.println(
+-            "\t{0}.u8[0] = ({1}.f32 != {1}.f32) || ({1}.f32 > 65504.0f) ? 0xFF : "
+-            "(({2}.u32[{3}]&0x7f800000)>>23);",
+-            ctx.v_temp(), ctx.temp(), ctx.v(ctx.insn.operands[1]), srcIdx);
+-        ctx.println("\t{}.u16 = {}.u8[0] != 0xFF ? (({}.u32[{}]&0x7FE000)>>13) : 0x0;", ctx.temp(),
+-                    ctx.v_temp(), ctx.v(ctx.insn.operands[1]), srcIdx);
++            "	{0}.u8[0] = ({1}.f32 != {1}.f32) || ({1}.f32 > 65504.0f) ? 0xFF : "
++            "((_vpks[{2}]&0x7f800000)>>23);",
++            ctx.v_temp(), ctx.temp(), srcIdx);
++        ctx.println("	{}.u16 = {}.u8[0] != 0xFF ? ((_vpks[{}]&0x7FE000)>>13) : 0x0;", ctx.temp(),
++                    ctx.v_temp(), srcIdx);
+         ctx.println(
+-            "\t{0}.u16[{1}] = {2}.u8[0] != 0xFF ? ({2}.u8[0] > 0x70 ? "
++            "	{0}.u16[{1}] = {2}.u8[0] != 0xFF ? ({2}.u8[0] > 0x70 ? "
+             "((({2}.u8[0]-0x70)<<10)+{3}.u16) : (0x71-{2}.u8[0] > 31 ? 0x0 : "
+             "((0x400+{3}.u16)>>(0x71-{2}.u8[0])))) : 0x7FFF;",
+             ctx.v(ctx.insn.operands[0]), dstIdx, ctx.v_temp(), ctx.temp());
+-        ctx.println("\t{}.u16[{}] |= (({}.u32[{}]&0x80000000)>>16);", ctx.v(ctx.insn.operands[0]),
+-                    dstIdx, ctx.v(ctx.insn.operands[1]), srcIdx);
++        ctx.println("	{}.u16[{}] |= ((_vpks[{}]&0x80000000)>>16);", ctx.v(ctx.insn.operands[0]),
++                    dstIdx, srcIdx);
+       }
++      ctx.println("	}}");
+       break;
+     }
+ 
+@@ -1324,31 +1339,31 @@ bool build_vpkd3d128(BuilderContext& ctx) {
+ 
+     case 5:  // float16_4
+     {
+-      // Pack 4 elements into 64 bits (4 x 16-bit floats)
+-      // Guest element 0 goes to highest 16-bit position, element 3 to lowest
+-      // Output u16 index = (3-i) + 2*shift for element i
+       if (ctx.insn.operands[3] != 2 || ctx.insn.operands[4] > 2)
+         REXCODEGEN_WARN("Unexpected float16_4 pack instruction at {:X}", ctx.base);
+-
++      // Snapshot the source first: vD may alias vB (in-place pack), and writing the destination
++      // halfwords would otherwise corrupt source words that are read later (rexglue-sdk#457).
++      ctx.println("	{{ const uint32_t _vpks[4] = {{{0}.u32[0], {0}.u32[1], {0}.u32[2], {0}.u32[3]}};",
++                  ctx.v(ctx.insn.operands[1]));
+       for (size_t i = 0; i < 4; i++) {
+         size_t srcIdx = 3 - i;  // Guest element i is at host array index 3-i
+-        size_t dstIdx = (3 - i) + (2 * ctx.insn.operands[4]);  // Output also reversed
+-        ctx.println("\t{}.u32 = ({}.u32[{}]&0x7FFFFFFF);", ctx.temp(), ctx.v(ctx.insn.operands[1]),
+-                    srcIdx);
++        size_t dstIdx = (3 - i) + (2 * ctx.insn.operands[4]);
++        ctx.println("	{}.u32 = (_vpks[{}]&0x7FFFFFFF);", ctx.temp(), srcIdx);
+         ctx.println(
+-            "\t{0}.u8[0] = ({1}.f32 != {1}.f32) || ({1}.f32 > 65504.0f) ? 0xFF : "
+-            "(({2}.u32[{3}]&0x7f800000)>>23);",
+-            ctx.v_temp(), ctx.temp(), ctx.v(ctx.insn.operands[1]), srcIdx);
+-        ctx.println("\t{}.u16 = {}.u8[0] != 0xFF ? (({}.u32[{}]&0x7FE000)>>13) : 0x0;", ctx.temp(),
+-                    ctx.v_temp(), ctx.v(ctx.insn.operands[1]), srcIdx);
++            "	{0}.u8[0] = ({1}.f32 != {1}.f32) || ({1}.f32 > 65504.0f) ? 0xFF : "
++            "((_vpks[{2}]&0x7f800000)>>23);",
++            ctx.v_temp(), ctx.temp(), srcIdx);
++        ctx.println("	{}.u16 = {}.u8[0] != 0xFF ? ((_vpks[{}]&0x7FE000)>>13) : 0x0;", ctx.temp(),
++                    ctx.v_temp(), srcIdx);
+         ctx.println(
+-            "\t{0}.u16[{1}] = {2}.u8[0] != 0xFF ? ({2}.u8[0] > 0x70 ? "
++            "	{0}.u16[{1}] = {2}.u8[0] != 0xFF ? ({2}.u8[0] > 0x70 ? "
+             "((({2}.u8[0]-0x70)<<10)+{3}.u16) : (0x71-{2}.u8[0] > 31 ? 0x0 : "
+             "((0x400+{3}.u16)>>(0x71-{2}.u8[0])))) : 0x7FFF;",
+             ctx.v(ctx.insn.operands[0]), dstIdx, ctx.v_temp(), ctx.temp());
+-        ctx.println("\t{}.u16[{}] |= (({}.u32[{}]&0x80000000)>>16);", ctx.v(ctx.insn.operands[0]),
+-                    dstIdx, ctx.v(ctx.insn.operands[1]), srcIdx);
++        ctx.println("	{}.u16[{}] |= ((_vpks[{}]&0x80000000)>>16);", ctx.v(ctx.insn.operands[0]),
++                    dstIdx, srcIdx);
+       }
++      ctx.println("	}}");
+       break;
+     }
+ 
+diff --git a/src/core/cvar.cpp b/src/core/cvar.cpp
+index 228728d..53af1a4 100644
+--- a/src/core/cvar.cpp
++++ b/src/core/cvar.cpp
+@@ -535,13 +535,35 @@ std::vector<std::string> ListModifiedFlags() {
+   return result;
+ }
+ 
++// SVR07: Windows paths contain backslashes, which are escapes in TOML basic
++// strings; unescaped they made the whole saved config fail to parse on the next
++// launch (all settings silently reset).
++static std::string EscapeTomlString(const std::string& value) {
++  std::string out;
++  out.reserve(value.size());
++  for (char c : value) {
++    if (c == '\\' || c == '"') {
++      out += '\\';
++    }
++    out += c;
++  }
++  return out;
++}
++
++// Values given on the command line or via environment are one-off launch
++// overrides (e.g. --user_data_root from a launcher); don't bake them into the file.
++template <typename Entry>
++static bool IsPersistedSource(const Entry& entry) {
++  return entry.source != Source::kCommandLine && entry.source != Source::kEnvironment;
++}
++
+ std::string SerializeToTOML() {
+   std::lock_guard lock(GetRegistryMutex());
+   std::string result;
+   for (const auto& entry : GetRegistryStorage()) {
+-    if (entry.getter() != entry.default_value) {
++    if (entry.getter() != entry.default_value && IsPersistedSource(entry)) {
+       if (entry.type == FlagType::String) {
+-        result += entry.name + " = \"" + entry.getter() + "\"\n";
++        result += entry.name + " = \"" + EscapeTomlString(entry.getter()) + "\"\n";
+       } else {
+         result += entry.name + " = " + entry.getter() + "\n";
+       }
+@@ -554,9 +576,10 @@ std::string SerializeToTOML(std::string_view category) {
+   std::lock_guard lock(GetRegistryMutex());
+   std::string result;
+   for (const auto& entry : GetRegistryStorage()) {
+-    if (entry.category == category && entry.getter() != entry.default_value) {
++    if (entry.category == category && entry.getter() != entry.default_value &&
++        IsPersistedSource(entry)) {
+       if (entry.type == FlagType::String) {
+-        result += entry.name + " = \"" + entry.getter() + "\"\n";
++        result += entry.name + " = \"" + EscapeTomlString(entry.getter()) + "\"\n";
+       } else {
+         result += entry.name + " = " + entry.getter() + "\n";
+       }
+diff --git a/src/core/logging.cpp b/src/core/logging.cpp
+index 1645848..cd55250 100644
+--- a/src/core/logging.cpp
++++ b/src/core/logging.cpp
+@@ -9,6 +9,7 @@
+  *              See LICENSE file in the project root for full license text.
+  */
+ 
++#include <chrono>
+ #include <algorithm>
+ #include <cctype>
+ #include <charconv>
+@@ -232,6 +233,9 @@ void InitLogging(const LogConfig& config) {
+     sink->set_level(spdlog::level::trace);
+     sink->set_pattern(config.file_pattern);
+     g_file_sink = sink;
++    // flush_on() only covers warnings and above; without this, info lines from
++    // the moments before a hard crash never reach the file.
++    spdlog::flush_every(std::chrono::seconds(1));
+   }
+ 
+   g_extra_sinks = config.extra_sinks;
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index a744375..d32e01c 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -17,6 +17,8 @@
+ 
+ #include <fmt/format.h>
+ 
++#include <thread>
++
+ #include <rex/cvar.h>
+ #include <rex/dbg.h>
+ #include <rex/perf/counter.h>
+@@ -74,6 +76,16 @@ REXCVAR_DEFINE_INT32(query_occlusion_fake_sample_count, 1000, "GPU",
+     .range(1, 100000)
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_INT32(gpu_command_delay_us, 0, "GPU",
++                     "Debug: wait this long after new ring buffer commands arrive before "
++                     "executing them, emulating real GPU latency (tests CPU/GPU write races)")
++    .range(0, 100000)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_BOOL(gpu_constant_diag, false, "GPU",
++                    "Debug: log NaN/huge shader constants as they are uploaded (costs CPU)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
+                     "Compile shaders and create pipelines asynchronously in background "
+                     "threads. This reduces stutter but may cause brief visual artifacts while "
+@@ -238,6 +250,11 @@ void CommandProcessor::WorkerThreadMain() {
+     }
+     assert_true(read_ptr_index_ != write_ptr_index);
+ 
++    if (int32_t delay_us = REXCVAR_GET(gpu_command_delay_us); delay_us > 0) {
++      std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
++      write_ptr_index = write_ptr_index_.load();
++    }
++
+     // Execute. Note that we handle wraparound transparently.
+     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
+ 
+@@ -521,6 +538,23 @@ void CommandProcessor::WriteRegisterRangeFromRing(memory::RingBuffer* ring, uint
+ void CommandProcessor::WriteALURangeFromRing(memory::RingBuffer* ring, uint32_t base,
+                                              uint32_t num_registers) {
+   WriteRegisterRangeFromRing(ring, base + 0x4000, num_registers);
++  // Diagnostic: flag absurd shader constants (e.g. corrupted bone matrices).
++  static uint64_t alu_ring_bad_count = 0;
++  for (uint32_t i = 0; REXCVAR_GET(gpu_constant_diag) && i < num_registers && base + i < 0x800;
++       ++i) {
++    uint32_t bits = register_file_->values[0x4000 + base + i];
++    float f;
++    std::memcpy(&f, &bits, sizeof(f));
++    if (!(std::fabs(f) < 1.0e6f)) {
++      ++alu_ring_bad_count;
++      if (alu_ring_bad_count <= 200 || !(alu_ring_bad_count & 1023)) {
++        REXGPU_WARN("SET_CONSTANT: suspicious ALU value {} (0x{:08X}) in c{}.{} (range c{}+{}), "
++                    "total {}",
++                    f, bits, (base + i) / 4, "xyzw"[(base + i) & 3], base / 4, num_registers / 4,
++                    alu_ring_bad_count);
++      }
++    }
++  }
+ }
+ 
+ void CommandProcessor::WriteFetchRangeFromRing(memory::RingBuffer* ring, uint32_t base,
+@@ -1480,6 +1514,28 @@ bool CommandProcessor::ExecutePacketType3_LOAD_ALU_CONSTANT(memory::RingBuffer*
+   size_dwords &= 0xFFF;
+   uint32_t type = (offset_type >> 16) & 0xFF;
+   uint32_t* xlat_address = memory_->TranslatePhysical<uint32_t*>(address);
++  if (type == 0 && REXCVAR_GET(gpu_constant_diag)) {
++    // Diagnostic: constants (e.g. bone matrices) loaded from guest memory.
++    static uint64_t alu_load_count = 0, alu_bad_count = 0;
++    ++alu_load_count;
++    if (alu_load_count <= 20 || !(alu_load_count & 65535)) {
++      REXGPU_INFO("LOAD_ALU_CONSTANT #{}: {:08X} index {} dwords {}", alu_load_count, address,
++                  index, size_dwords);
++    }
++    for (uint32_t i = 0; i < size_dwords; ++i) {
++      uint32_t bits = rex::byte_swap(xlat_address[i]);
++      float f;
++      std::memcpy(&f, &bits, sizeof(f));
++      if (!(std::fabs(f) < 1.0e7f)) {
++        ++alu_bad_count;
++        if (alu_bad_count <= 100) {
++          REXGPU_WARN("LOAD_ALU_CONSTANT: suspicious value {} (0x{:08X}) at {:08X} const {}",
++                      f, bits, address + i * 4, index + i / 4);
++        }
++        break;
++      }
++    }
++  }
+   switch (type) {
+     case 0:  // ALU
+       WriteALURangeFromMem(index, xlat_address, size_dwords);
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 19874a5..1ede43f 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cstdarg>
+ #include <cstring>
+ #include <sstream>
+@@ -1893,6 +1894,19 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
+ 
+ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                       uint32_t frontbuffer_height) {
++  {
++    // Diagnostic: log swap (frame) rate every 5 seconds.
++    static auto fps_t0 = std::chrono::steady_clock::now();
++    static uint32_t fps_frames = 0;
++    ++fps_frames;
++    auto fps_now = std::chrono::steady_clock::now();
++    double fps_dt = std::chrono::duration<double>(fps_now - fps_t0).count();
++    if (fps_dt >= 5.0) {
++      REXGPU_INFO("FPS: {:.1f} ({} swaps in {:.1f}s)", fps_frames / fps_dt, fps_frames, fps_dt);
++      fps_frames = 0;
++      fps_t0 = fps_now;
++    }
++  }
+   SCOPE_profile_cpu_f("gpu");
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
+@@ -2506,11 +2520,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+                       vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
+           return false;
+       }
++      // Always request the range here: the guest may have rewritten the data at
++      // the same address and size since it was last seen (dynamic and ring
++      // buffers), and RequestRange only uploads pages invalidated by the write
++      // watch anyway. Skipping it on a matching address/size served stale
++      // vertices from a previous frame (one-frame stretched geometry).
+       VertexBufferState& state = vertex_buffer_states_[vfetch_index];
+-      if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
+-        vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
+-        continue;
+-      }
+       if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
+         REXGPU_ERROR(
+             "Failed to request vertex buffer at 0x{:08X} (size {}) in the "
+@@ -2544,6 +2559,19 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+       return false;
+     }
+   }
++  if (memexport_used) {
++    // Diagnostic: does this title write vertex data from shaders?
++    static uint64_t memexport_draw_count = 0;
++    ++memexport_draw_count;
++    if (memexport_draw_count <= 30 || !(memexport_draw_count & 4095)) {
++      REXGPU_INFO("Memexport draw #{} (VS {} PS {}): {} ranges, first {:08X}+{}",
++                  memexport_draw_count, memexport_used_vertex, memexport_used_pixel,
++                  memexport_ranges_.size(),
++                  memexport_ranges_.empty() ? 0u
++                                            : memexport_ranges_[0].base_address_dwords << 2,
++                  memexport_ranges_.empty() ? 0u : memexport_ranges_[0].size_bytes);
++    }
++  }
+   if (memexport_used && memexport_ranges_.empty()) {
+     if (!shared_memory_->RequestRange(0, SharedMemory::kBufferSize)) {
+       REXGPU_ERROR(
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 8f2fcb0..c3797f8 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -17,6 +17,11 @@
+ #include <functional>
+ #include <memory>
+ #include <mutex>
++
++#ifdef _WIN32
++#include <timeapi.h>
++#pragma comment(lib, "winmm.lib")
++#endif
+ #include <utility>
+ 
+ #include <rex/cvar.h>
+@@ -158,6 +163,10 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
+         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
+         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
++#ifdef _WIN32
++        // 1 ms Sleep granularity so vblanks fire at a true 60 Hz (HollywoodAkeem tweak).
++        timeBeginPeriod(1);
++#endif
+         while (vsync_worker_running_) {
+           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+           uint64_t interval_ticks =
+@@ -168,6 +177,9 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+           }
+           rex::thread::Sleep(std::chrono::milliseconds(1));
+         }
++#ifdef _WIN32
++        timeEndPeriod(1);
++#endif
+         return 0;
+       }));
+   // TODO: set_can_debugger_suspend not yet ported
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index ec0df7c..e3141a2 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -10,16 +10,24 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cstring>
+ #include <utility>
+ 
+ #include <rex/assert.h>
+ #include <rex/bit.h>
+ #include <rex/dbg.h>
++#include <rex/cvar.h>
+ #include <rex/graphics/shared_memory.h>
++#include <rex/hash.h>
++#include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/memory.h>
+ 
++REXCVAR_DEFINE_BOOL(gpu_verify_shared_memory, false, "GPU",
++                    "Debug: hash CPU-uploaded pages and log when guest memory changes without "
++                    "the write watch invalidating them (stale vertex/texture data). Slow.");
++
+ namespace rex::graphics {
+ 
+ SharedMemory::SharedMemory(memory::Memory& memory) : memory_(memory) {
+@@ -403,8 +411,17 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+     }
+     upload_ranges_.emplace_back(page_start, page_count);
+   };
++  bool verify = REXCVAR_GET(gpu_verify_shared_memory);
+   {
+     auto global_lock = global_critical_region_.Acquire();
++    if (verify) {
++      static bool logged = false;
++      if (!logged) {
++        logged = true;
++        REXGPU_INFO("Shared memory: gpu_verify_shared_memory active");
++      }
++      VerifyValidPages(merged_ranges);
++    }
+     for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
+       uint32_t page_first = range.first >> page_size_log2_;
+       uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
+@@ -465,7 +482,63 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+     return true;
+   }
+ 
+-  return UploadRanges(upload_ranges_);
++  if (!UploadRanges(upload_ranges_)) {
++    return false;
++  }
++  if (verify) {
++    auto global_lock = global_critical_region_.Acquire();
++    if (debug_page_hashes_.size() != (kBufferSize >> page_size_log2_)) {
++      debug_page_hashes_.assign(kBufferSize >> page_size_log2_, 0);
++    }
++    if (debug_page_upload_time_.size() != (kBufferSize >> page_size_log2_)) {
++      debug_page_upload_time_.assign(kBufferSize >> page_size_log2_, 0);
++    }
++    int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
++    for (const std::pair<uint32_t, uint32_t>& range : upload_ranges_) {
++      for (uint32_t page = range.first; page < range.first + range.second; ++page) {
++        debug_page_upload_time_[page] = now;
++        debug_page_hashes_[page] = XXH3_64bits(
++            memory().TranslatePhysical(page << page_size_log2_), size_t(1) << page_size_log2_);
++      }
++    }
++  }
++  return true;
++}
++
++void SharedMemory::VerifyValidPages(
++    const std::vector<std::pair<uint32_t, uint32_t>>& ranges) {
++  // Called with the global critical region held. A CPU-uploaded page that is
++  // still valid must not have changed in guest memory: a write would have hit
++  // the write watch and invalidated it first.
++  if (debug_page_hashes_.size() != (kBufferSize >> page_size_log2_)) {
++    return;
++  }
++  for (const std::pair<uint32_t, uint32_t>& range : ranges) {
++    uint32_t page_first = range.first >> page_size_log2_;
++    uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
++    for (uint32_t page = page_first; page <= page_last; ++page) {
++      uint64_t bit = uint64_t(1) << (page & 63);
++      if (!(system_page_flags_valid_[page >> 6] & bit) ||
++          (system_page_flags_valid_and_gpu_written_[page >> 6] & bit)) {
++        continue;
++      }
++      uint64_t& stored = debug_page_hashes_[page];
++      if (!stored) {
++        continue;
++      }
++      uint64_t current = XXH3_64bits(memory().TranslatePhysical(page << page_size_log2_),
++                                     size_t(1) << page_size_log2_);
++      if (current != stored) {
++        ++debug_stale_page_count_;
++        if (debug_stale_page_count_ <= 200 || !(debug_stale_page_count_ & 1023)) {
++          REXGPU_WARN("Shared memory: stale page {:08X} (guest changed it without "
++                      "invalidation), total {}",
++                      page << page_size_log2_, debug_stale_page_count_);
++        }
++        stored = current;
++      }
++    }
++  }
+ }
+ 
+ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
+@@ -494,6 +567,23 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
+ 
+   auto global_lock = global_critical_region_.Acquire();
+ 
++  if (!debug_page_upload_time_.empty()) {
++    // A guest write very soon after the GPU copied the page suggests the guest
++    // was still filling it when the draw was processed (half-written data).
++    int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
++    for (uint32_t page = page_first; page <= page_last; ++page) {
++      int64_t uploaded = debug_page_upload_time_[page];
++      if (uploaded && now - uploaded < 2000000) {
++        ++debug_late_write_count_;
++        if (debug_late_write_count_ <= 300 || !(debug_late_write_count_ & 1023)) {
++          REXGPU_WARN("Shared memory: guest wrote page {:08X} {} us after GPU upload, total {}",
++                      page << page_size_log2_, (now - uploaded) / 1000, debug_late_write_count_);
++        }
++      }
++      debug_page_upload_time_[page] = 0;
++    }
++  }
++
+   if (!exact_range) {
+     // Check if a somewhat wider range (up to 256 KB with 4 KB pages) can be
+     // invalidated - if no GPU-written data nearby that was not intended to be
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 001f36b..9ba17ae 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <array>
+ #include <cstdint>
+ #include <cstring>
+@@ -2271,6 +2272,19 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
+ 
+ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                        uint32_t frontbuffer_height) {
++  {
++    // Diagnostic: log guest swap (frame) rate every 5 seconds.
++    static auto fps_t0 = std::chrono::steady_clock::now();
++    static uint32_t fps_frames = 0;
++    ++fps_frames;
++    auto fps_now = std::chrono::steady_clock::now();
++    double fps_dt = std::chrono::duration<double>(fps_now - fps_t0).count();
++    if (fps_dt >= 5.0) {
++      REXGPU_INFO("FPS: {:.1f} ({} swaps in {:.1f}s)", fps_frames / fps_dt, fps_frames, fps_dt);
++      fps_frames = 0;
++      fps_t0 = fps_now;
++    }
++  }
+   SCOPE_profile_cpu_f("gpu");
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
+@@ -4009,11 +4023,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+                       vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
+           return false;
+       }
++      // Always request: the guest may have rewritten the same address/size
++      // (see the D3D12 command processor).
+       VertexBufferState& state = vertex_buffer_states_[vfetch_index];
+-      if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
+-        vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
+-        continue;
+-      }
+       if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
+         REXGPU_ERROR(
+             "Failed to request vertex buffer at 0x{:08X} (size {}) in the shared "
+diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
+index 813bb1c..9f00af4 100644
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -66,8 +66,13 @@ void InputSystem::AttachWindow(rex::ui::Window* window) {
+ }
+ 
+ void InputSystem::SetActiveCallback(std::function<bool()> callback) {
++  // SVR07: only the keyboard/mouse driver goes inactive while an overlay is open
++  // (releases the cursor). Real pads stay live so the pad hook can drive the F4
++  // menu; the hook hides them from the game instead.
+   for (auto& driver : drivers_) {
+-    driver->set_is_active_callback(callback);
++    if (dynamic_cast<mnk::MnkInputDriver*>(driver.get())) {
++      driver->set_is_active_callback(callback);
++    }
+   }
+ }
+ 
+@@ -212,6 +217,10 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+   return driver->GetDeviceCapabilities(chosen, flags, out_caps);
+ }
+ 
++void InputSystem::SetPadHook(std::function<bool(const X_INPUT_GAMEPAD&)> hook) {
++  pad_hook_ = std::move(hook);
++}
++
+ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+   SCOPE_profile_cpu_f("hid");
+   if (!assignment_) {
+@@ -245,6 +254,12 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+   if (!any) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
++  if (user_index == 0 && pad_hook_ && pad_hook_(merged.gamepad)) {
++    merged.gamepad = {};
++  }
++  if (g_input_blocked.load(std::memory_order_relaxed)) {
++    merged.gamepad = {};
++  }
+   if (out_state) {
+     *out_state = merged;
+   }
+diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
+index 3f9422d..02e4bd9 100644
+--- a/src/input/mnk/mnk_input_driver.cpp
++++ b/src/input/mnk/mnk_input_driver.cpp
+@@ -27,6 +27,8 @@ REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller
+ REXCVAR_DEFINE_BOOL(mnk_mouse, false, "Input",
+                     "Use the mouse for the right stick. Off means the right stick comes "
+                     "from the keybind_rstick_* keys only");
++REXCVAR_DEFINE_BOOL(mnk_ignore_focus, false, "Input",
++                    "Accept keyboard input while the window is unfocused (for scripted testing)");
+ REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse sensitivity for right stick")
+     .range(0.01, 10.0);
+ 
+@@ -264,7 +266,7 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
+   QueueMouseCaptureUpdate(IsEnabled() && REXCVAR_GET(mnk_mouse) && IsMouseLookActive() &&
+                           has_focus_ && is_active());
+ 
+-  if (!is_active() || !has_focus_) {
++  if (!is_active() || !(has_focus_ || REXCVAR_GET(mnk_ignore_focus))) {
+     if (out_state) {
+       std::memset(out_state, 0, sizeof(*out_state));
+       out_state->packet_number = packet_number_;
+@@ -481,7 +483,7 @@ void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
+ }
+ 
+ void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
+-  if (!IsEnabled() || !has_focus_)
++  if (!IsEnabled() || !(has_focus_ || REXCVAR_GET(mnk_ignore_focus)))
+     return;
+   std::lock_guard lock(state_mutex_);
+   uint16_t vk = static_cast<uint16_t>(e.virtual_key());
+@@ -497,7 +499,7 @@ void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
+ }
+ 
+ void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
+-  if (!IsEnabled() || !has_focus_)
++  if (!IsEnabled() || !(has_focus_ || REXCVAR_GET(mnk_ignore_focus)))
+     return;
+   std::lock_guard lock(state_mutex_);
+   switch (e.button()) {
+@@ -535,7 +537,7 @@ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
+ }
+ 
+ void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
+-  if (!IsEnabled() || !has_focus_)
++  if (!IsEnabled() || !(has_focus_ || REXCVAR_GET(mnk_ignore_focus)))
+     return;
+   int32_t x = e.x();
+   int32_t y = e.y();
+diff --git a/src/kernel/xam/xam_content.cpp b/src/kernel/xam/xam_content.cpp
+index 1fb1e16..ed65e3e 100644
+--- a/src/kernel/xam/xam_content.cpp
++++ b/src/kernel/xam/xam_content.cpp
+@@ -107,7 +107,8 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
+     // TODO(gibbed): disc drive content
+   }
+ 
+-  REXKRNL_DEBUG("XamContentCreateEnumerator: added {} items to enumerator", e->item_count());
++  REXKRNL_INFO("XamContentCreateEnumerator: device={} type={:08X} -> {} items",
++               uint32_t(device_id), uint32_t(content_type), e->item_count());
+ 
+   *handle_out = e->handle();
+   return X_ERROR_SUCCESS;
+@@ -224,6 +225,12 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
+       *disposition_ptr = static_cast<uint32_t>(disposition);
+     }
+ 
++    REXKRNL_INFO("XamContentCreate: root='{}' file='{}' device={} type={:08X} flags={:X} -> "
++                 "disposition={} result={:08X}",
++                 root_name, content_data.file_name(), uint32_t(content_data.device_id),
++                 uint32_t(XContentType(content_data.content_type)), uint32_t(flags), uint32_t(disposition),
++                 result);
++
+     extended_error = X_HRESULT_FROM_WIN32(result);
+     length = static_cast<uint32_t>(disposition);
+     return result;
+@@ -281,6 +288,7 @@ u32 XamContentFlush_entry(mapped_string root_name, mapped_void overlapped_ptr) {
+ u32 XamContentClose_entry(mapped_string root_name, mapped_void overlapped_ptr) {
+   // Closes a previously opened root from XamContentCreate*.
+   auto result = REX_KERNEL_STATE()->content_manager()->CloseContent(root_name.value());
++  REXKRNL_INFO("XamContentClose: root='{}' -> {:08X}", root_name.value(), result);
+ 
+   if (overlapped_ptr) {
+     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
+@@ -316,6 +324,8 @@ u32 XamContentGetCreator_entry(u32 user_index, mapped_void content_data_ptr,
+   } else {
+     result = X_ERROR_PATH_NOT_FOUND;
+   }
++  REXKRNL_INFO("XamContentGetCreator: file='{}' device={} -> {:08X}", content_data.file_name(),
++               uint32_t(content_data.device_id), result);
+ 
+   if (overlapped_ptr) {
+     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp b/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp
+index bd5de65..f1aee1a 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp
+@@ -267,7 +267,14 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
+         basic_result &= file->entry()->SetWriteTimestamp(info->last_write_time);
+       }
+ 
+-      basic_result &= file->entry()->SetAttributes(info->attributes);
++      // NT semantics: FileAttributes == 0 means "leave unchanged", and the
++      // directory bit cannot be changed through FileBasicInformation.
++      uint32_t attributes = info->attributes;
++      if (attributes) {
++        uint32_t directory_bit = file->entry()->attributes() & X_FILE_ATTRIBUTE_DIRECTORY;
++        attributes = (attributes & ~uint32_t(X_FILE_ATTRIBUTE_DIRECTORY)) | directory_bit;
++        basic_result &= file->entry()->SetAttributes(attributes);
++      }
+       if (!basic_result) {
+         result = X_STATUS_UNSUCCESSFUL;
+       }
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_memory.cpp b/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
+index 8684eda..aada96a 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
+@@ -203,7 +203,11 @@ u32 NtAllocateVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_si
+ u32 NtProtectVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_size_ptr,
+                                  u32 protect_bits, mapped_u32 old_protect, u32 debug_memory) {
+   // Set to TRUE when this memory refers to devkit memory area.
+-  assert_true(debug_memory == 0);
++  // (HollywoodAkeem tweak) devkit-memory flag is ignored instead of asserting.
++  if ((uint32_t)debug_memory != 0) {
++    REXKRNL_WARN("debug_memory {} ignored", (uint32_t)debug_memory);
++    debug_memory = 0;
++  }
+ 
+   // Must request a size.
+   if (!base_addr_ptr || !region_size_ptr || !*region_size_ptr) {
+@@ -261,7 +265,11 @@ u32 NtFreeVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_size_p
+   // _In_     BOOLEAN DebugMemory
+ 
+   // Set to TRUE when freeing external devkit memory.
+-  assert_true(debug_memory == 0);
++  // (HollywoodAkeem tweak) devkit-memory flag is ignored instead of asserting.
++  if ((uint32_t)debug_memory != 0) {
++    REXKRNL_WARN("debug_memory {} ignored", (uint32_t)debug_memory);
++    debug_memory = 0;
++  }
+ 
+   if (!base_addr_value) {
+     return X_STATUS_MEMORY_NOT_ALLOCATED;
+@@ -571,13 +579,15 @@ u32 MmGetPhysicalAddress_entry(u32 base_address) {
+ 
+ u32 MmMapIoSpace_entry(u32 unk0, mapped_void src_address, u32 size, u32 flags) {
+   // I've only seen this used to map XMA audio contexts.
+-  // The code seems fine with taking the src address, so this just returns that.
+-  // If others start using it there could be problems.
++  // src_address is a physical address; return the matching vE0000000 virtual address so the
++  // caller reads the real XMA context (HollywoodAkeem tweak):
++  //   phys = (virt - 0xE0000000) + 0x1000
+   assert_true(unk0 == 2);
+   assert_true(size == 0x40);
+   assert_true(flags == 0x404);
+ 
+-  return src_address.guest_address();
++  uint32_t physical_address = src_address.guest_address();
++  return physical_address - 0x1000 + 0xE0000000;
+ }
+ 
+ struct X_POOL_ALLOC_HEADER {
+diff --git a/src/system/kernel_state.cpp b/src/system/kernel_state.cpp
+index 697399c..0afdb1e 100644
+--- a/src/system/kernel_state.cpp
++++ b/src/system/kernel_state.cpp
+@@ -1220,6 +1220,15 @@ void KernelState::CompleteOverlappedDeferredEx(
+   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
+   XOverlappedSetResult(ptr, X_ERROR_IO_PENDING);
+   XOverlappedSetContext(ptr, XThread::GetCurrentThreadHandle());
++  // Starting an async operation unsignals its event, as overlapped I/O does on
++  // Windows. Titles that reuse one XOVERLAPPED would otherwise see the event
++  // still set by the previous operation and read a result that is still
++  // pending (SvR2007 reports its storage device as removed).
++  if (X_HANDLE event_handle = XOverlappedGetEvent(ptr)) {
++    if (auto ev = object_table()->LookupObject<XEvent>(event_handle)) {
++      ev->Reset();
++    }
++  }
+   auto global_lock = global_critical_region_.Acquire();
+   dispatch_queue_.push_back(
+       [this, completion_callback, overlapped_ptr, pre_callback, post_callback]() {
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 76cc877..b034962 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -1498,8 +1498,8 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t
+   }
+   if (start_page_number == UINT_MAX || end_page_number == UINT_MAX) {
+     // Out of memory.
+-    REXSYS_ERROR("BaseHeap::Alloc failed to find contiguous range");
+-    assert_always("Heap exhausted!");
++    // (HollywoodAkeem tweak) soft-fail: the game probes memory and handles failure itself.
++    REXSYS_WARN("BaseHeap::Alloc failed to find contiguous range");
+     return false;
+   }
+ 
+diff --git a/src/ui/imgui_drawer.cpp b/src/ui/imgui_drawer.cpp
+index f270f3c..a3dd024 100644
+--- a/src/ui/imgui_drawer.cpp
++++ b/src/ui/imgui_drawer.cpp
+@@ -412,6 +412,7 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
+   io.DisplaySize.x = window_->GetActualPhysicalWidth() * physical_to_logical;
+   io.DisplaySize.y = window_->GetActualPhysicalHeight() * physical_to_logical;
+ 
++  ApplyGamepadInput(io);
+   ImGui::NewFrame();
+ 
+   assert_true(!IsDrawingDialogs());
+@@ -436,7 +437,18 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
+   // it now if needed.
+   DetachIfLastDialogRemoved();
+ 
+-  if (!dialogs_.empty()) {
++  // SVR07: only dialogs with something to show need continuous repaints. The
++  // always-alive achievement toast used to keep the UI thread presenting at the
++  // monitor refresh rate (165-220 presents/s on a 239 Hz screen, uneven frame
++  // pacing); when idle, painting follows guest frames instead.
++  bool any_active = false;
++  for (ImGuiDialog* dialog : dialogs_) {
++    if (!dialog->IsIdle()) {
++      any_active = true;
++      break;
++    }
++  }
++  if (any_active) {
+     // Repaint (and handle input) continuously if still active. In detached mode
+     // there is no presenter; the app drives repaint via its own present loop.
+     if (presenter_) {
+@@ -487,6 +499,61 @@ ImGuiIO& ImGuiDrawer::GetIO() {
+   return ImGui::GetIO();
+ }
+ 
++void ImGuiDrawer::SetGamepadInput(bool active, uint16_t buttons, int16_t lx, int16_t ly) {
++  uint64_t v = (uint64_t(active) << 63) | (uint64_t(buttons) << 32) |
++               (uint64_t(uint16_t(lx)) << 16) | uint64_t(uint16_t(ly));
++  gamepad_packed_.store(v, std::memory_order_relaxed);
++}
++
++void ImGuiDrawer::ApplyGamepadInput(ImGuiIO& io) {
++  uint64_t v = gamepad_packed_.load(std::memory_order_relaxed);
++  bool active = (v >> 63) != 0;
++  uint16_t buttons = active ? uint16_t(v >> 32) : 0;
++  int16_t lx = active ? int16_t((v >> 16) & 0xFFFF) : 0;
++  int16_t ly = active ? int16_t(v & 0xFFFF) : 0;
++  if (!active && !gamepad_prev_active_) {
++    return;
++  }
++  if (active) {
++    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
++    io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
++  }
++  struct Map {
++    uint16_t mask;
++    ImGuiKey key;
++  };
++  static const Map kMap[] = {
++      {0x0001, ImGuiKey_GamepadDpadUp},    {0x0002, ImGuiKey_GamepadDpadDown},
++      {0x0004, ImGuiKey_GamepadDpadLeft},  {0x0008, ImGuiKey_GamepadDpadRight},
++      {0x1000, ImGuiKey_GamepadFaceDown},  // A = activate
++      {0x2000, ImGuiKey_GamepadFaceRight},  // B = cancel
++      {0x4000, ImGuiKey_GamepadFaceLeft},  {0x8000, ImGuiKey_GamepadFaceUp},
++      {0x0100, ImGuiKey_GamepadL1},        {0x0200, ImGuiKey_GamepadR1},
++  };
++  for (const auto& m : kMap) {
++    bool now = (buttons & m.mask) != 0;
++    bool was = (gamepad_prev_buttons_ & m.mask) != 0;
++    if (now != was) {
++      io.AddKeyEvent(m.key, now);
++    }
++  }
++  // Left stick -> analog nav axes (dead zone 25%).
++  auto axis = [](int16_t a, bool positive) {
++    float f = float(a) / 32767.0f;
++    f = positive ? f : -f;
++    return f > 0.25f ? (f - 0.25f) / 0.75f : 0.0f;
++  };
++  io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickLeft, axis(lx, false) > 0, axis(lx, false));
++  io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickRight, axis(lx, true) > 0, axis(lx, true));
++  io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickUp, axis(ly, true) > 0, axis(ly, true));
++  io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickDown, axis(ly, false) > 0, axis(ly, false));
++  gamepad_prev_buttons_ = buttons;
++  gamepad_prev_active_ = active;
++  if (!active) {
++    io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
++  }
++}
++
+ void ImGuiDrawer::OnKeyDown(KeyEvent& e) {
+   OnKey(e, true);
+ }
+diff --git a/src/ui/overlay/achievement_toast.cpp b/src/ui/overlay/achievement_toast.cpp
+index 53b8c0b..6d440af 100644
+--- a/src/ui/overlay/achievement_toast.cpp
++++ b/src/ui/overlay/achievement_toast.cpp
+@@ -29,6 +29,11 @@ void AchievementToastDialog::Push(const rex::system::AchievementEvent& event) {
+   queue_.push_back({event, std::chrono::steady_clock::now()});
+ }
+ 
++bool AchievementToastDialog::IsIdle() {
++  std::lock_guard<std::mutex> lock(mutex_);
++  return queue_.empty();
++}
++
+ void AchievementToastDialog::OnDraw(ImGuiIO& io) {
+   auto now = std::chrono::steady_clock::now();
+ 
+diff --git a/src/ui/overlay/settings_overlay.cpp b/src/ui/overlay/settings_overlay.cpp
+index 4ede107..39c34b7 100644
+--- a/src/ui/overlay/settings_overlay.cpp
++++ b/src/ui/overlay/settings_overlay.cpp
+@@ -13,19 +13,73 @@
+ #include <rex/cvar.h>
+ #include <rex/string.h>
+ #include <rex/string/numeric.h>
++#include <rex/string.h>
++#include <rex/string/numeric.h>
+ #include <rex/ui/keybinds.h>
++#include <rex/logging.h>
+ #include <imgui.h>
+ 
+ #include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <ctime>
+ #include <map>
+ #include <set>
+ #include <string>
+ #include <vector>
++#ifdef _WIN32
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <shellapi.h>
++#pragma comment(lib, "shell32.lib")
++#endif
+ 
+ namespace rex::ui {
+ 
+-SettingsDialog::SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path)
+-    : ImGuiDialog(imgui_drawer), config_path_(std::move(config_path)) {}
++namespace {
++
++// Copy a save folder tree, leaving out the shader cache (large, rebuilt on demand).
++bool CopySaves(const std::filesystem::path& from, const std::filesystem::path& to,
++               std::string* error) {
++  std::error_code ec;
++  std::filesystem::create_directories(to, ec);
++  for (auto& entry : std::filesystem::directory_iterator(from, ec)) {
++    if (entry.path().filename() == "cache")
++      continue;
++    std::filesystem::copy(entry.path(), to / entry.path().filename(),
++                          std::filesystem::copy_options::recursive |
++                              std::filesystem::copy_options::overwrite_existing,
++                          ec);
++    if (ec) {
++      *error = ec.message();
++      return false;
++    }
++  }
++  if (ec) {
++    *error = ec.message();
++    return false;
++  }
++  return true;
++}
++
++}  // namespace
++
++SettingsDialog::SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path,
++                               std::function<void()> on_quit,
++                               std::function<void(bool)> set_fullscreen,
++                               std::function<bool()> is_fullscreen)
++    : ImGuiDialog(imgui_drawer),
++      config_path_(std::move(config_path)),
++      on_quit_(std::move(on_quit)),
++      set_fullscreen_(std::move(set_fullscreen)),
++      is_fullscreen_(std::move(is_fullscreen)) {}
+ 
+ SettingsDialog::~SettingsDialog() {}
+ 
+@@ -156,7 +210,262 @@ static rex::ui::VirtualKey ImGuiKeyToVirtualKey(ImGuiKey key) {
+   }
+ }
+ 
+-void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
++// Plain-language controls for the few settings players actually change. Every change is saved
++// to the config file right away.
++void SettingsDialog::DrawQuickSettings() {
++  struct Choice {
++    const char* label;
++    int value;
++  };
++  const float value_x = 200.0f;
++  auto set = [this](const char* name, const std::string& value) {
++    rex::cvar::SetFlagByName(name, value);
++    rex::cvar::SaveConfig(config_path_);
++  };
++  auto restart_note = [](const char* name) {
++    auto* info = rex::cvar::GetFlagInfo(name);
++    if (info && info->lifecycle == rex::cvar::Lifecycle::kRequiresRestart) {
++      ImGui::SameLine();
++      ImGui::TextDisabled("(applies next launch)");
++    }
++  };
++
++  ImGui::TextUnformatted("Quick settings");
++  ImGui::TextDisabled("Changes save automatically.");
++  ImGui::Spacing();
++
++  // Resolution scale: the game renders at 720p x scale.
++  if (rex::cvar::GetFlagInfo("resolution_scale")) {
++    static const Choice choices[] = {{"720p (original)", 1}, {"1440p", 2},      {"4K (2160p)", 3},
++                                     {"5K (2880p)", 4},      {"6K (3600p)", 5}, {"8K (4320p)", 6}};
++    int cur = std::atoi(rex::cvar::GetFlagByName("resolution_scale").c_str());
++    char custom[32];
++    std::snprintf(custom, sizeof(custom), "%dx (%dp)", cur, 720 * cur);
++    const char* preview = custom;
++    for (auto& c : choices) {
++      if (c.value == cur)
++        preview = c.label;
++    }
++    ImGui::PushID("resolution_scale");
++    ImGui::TextUnformatted("Render resolution");
++    ImGui::SameLine(value_x);
++    ImGui::SetNextItemWidth(220.0f);
++    if (ImGui::BeginCombo("##q", preview)) {
++      for (auto& c : choices) {
++        if (ImGui::Selectable(c.label, c.value == cur))
++          set("resolution_scale", std::to_string(c.value));
++      }
++      ImGui::EndCombo();
++    }
++    restart_note("resolution_scale");
++    ImGui::PopID();
++    ImGui::TextDisabled("Higher = sharper but harder on the GPU. Lower it if the game crashes.");
++  }
++
++  if (rex::cvar::GetFlagInfo("gpu_backend")) {
++    const std::string cur = rex::cvar::GetFlagByName("gpu_backend");
++    ImGui::PushID("gpu_backend");
++    ImGui::TextUnformatted("Graphics backend");
++    ImGui::SameLine(value_x);
++    ImGui::SetNextItemWidth(280.0f);
++    if (ImGui::BeginCombo("##q", cur == "d3d12" ? "Direct3D 12 (model glitches)" : "Vulkan")) {
++      if (ImGui::Selectable("Vulkan (recommended)", cur != "d3d12"))
++        set("gpu_backend", "vulkan");
++      if (ImGui::Selectable("Direct3D 12 (model glitches)", cur == "d3d12"))
++        set("gpu_backend", "d3d12");
++      ImGui::EndCombo();
++    }
++    ImGui::SameLine();
++    ImGui::TextDisabled("(applies next launch)");
++    ImGui::PopID();
++  }
++
++  // Fullscreen (live).
++  {
++    bool fs = is_fullscreen_ ? is_fullscreen_()
++                             : rex::string::from_string<bool>(rex::cvar::GetFlagByName("fullscreen"), false);
++    ImGui::PushID("fullscreen");
++    ImGui::TextUnformatted("Fullscreen (F11)");
++    ImGui::SameLine(value_x);
++    if (ImGui::Checkbox("##q", &fs)) {
++      if (set_fullscreen_)
++        set_fullscreen_(fs);
++      set("fullscreen", fs ? "true" : "false");
++    }
++    ImGui::PopID();
++  }
++
++  if (rex::cvar::GetFlagInfo("vsync")) {
++    bool v = rex::string::from_string<bool>(rex::cvar::GetFlagByName("vsync"), true);
++    ImGui::PushID("vsync");
++    ImGui::TextUnformatted("VSync");
++    ImGui::SameLine(value_x);
++    if (ImGui::Checkbox("##q", &v))
++      set("vsync", v ? "true" : "false");
++    restart_note("vsync");
++    ImGui::PopID();
++  }
++
++  if (rex::cvar::GetFlagInfo("present_effect") &&
++      rex::cvar::GetFlagInfo("present_cas_additional_sharpness")) {
++    struct Level {
++      const char* label;
++      double v;
++    };
++    static const Level levels[] = {{"Low", 0.2}, {"Medium", 0.5}, {"High", 0.8}, {"Max", 1.0}};
++    const std::string eff = rex::cvar::GetFlagByName("present_effect");
++    const double cur = std::atof(rex::cvar::GetFlagByName("present_cas_additional_sharpness").c_str());
++    int cur_idx = 0;
++    double best = 1e9;
++    for (int i = 0; i < 4; ++i) {
++      if (std::abs(levels[i].v - cur) < best) {
++        best = std::abs(levels[i].v - cur);
++        cur_idx = i;
++      }
++    }
++    int cur_entry = eff == "cas" ? 1 + cur_idx : 0;
++    auto entry_label = [&](int e) -> std::string {
++      return e == 0 ? "Off" : std::string("CAS, ") + levels[e - 1].label;
++    };
++    ImGui::PushID("sharpening");
++    ImGui::TextUnformatted("Sharpening (CAS)");
++    ImGui::SameLine(value_x);
++    ImGui::SetNextItemWidth(220.0f);
++    if (ImGui::BeginCombo("##q", entry_label(cur_entry).c_str())) {
++      for (int e = 0; e < 5; ++e) {
++        if (ImGui::Selectable(entry_label(e).c_str(), e == cur_entry)) {
++          if (e == 0) {
++            rex::cvar::SetFlagByName("present_effect", "bilinear");
++          } else {
++            rex::cvar::SetFlagByName("present_effect", "cas");
++            rex::cvar::SetFlagByName("present_cas_additional_sharpness",
++                                     std::to_string(levels[e - 1].v));
++          }
++          rex::cvar::SaveConfig(config_path_);
++        }
++      }
++      ImGui::EndCombo();
++    }
++    restart_note("present_effect");
++    ImGui::PopID();
++  }
++
++  if (rex::cvar::GetFlagInfo("pause_on_focus_loss")) {
++    bool v = rex::string::from_string<bool>(rex::cvar::GetFlagByName("pause_on_focus_loss"), true);
++    ImGui::PushID("pause_on_focus_loss");
++    ImGui::TextUnformatted("Mute + ignore pad");
++    ImGui::SameLine(value_x);
++    if (ImGui::Checkbox("##q", &v))
++      set("pause_on_focus_loss", v ? "true" : "false");
++    ImGui::SameLine();
++    ImGui::TextDisabled("(when the window is not focused)");
++    ImGui::PopID();
++  }
++
++  // Save backup / restore. Backups go to "<saves folder>-backups" beside the saves.
++  {
++    ImGui::Spacing();
++    ImGui::TextUnformatted("Saves");
++    std::error_code ec;
++    if (saves_dir_.empty() || !std::filesystem::is_directory(saves_dir_, ec)) {
++      ImGui::TextDisabled("Saves folder not found.");
++    } else {
++      const auto backups =
++          saves_dir_.parent_path() / (saves_dir_.filename().string() + "-backups");
++      if (ImGui::Button("Back up saves")) {
++        confirm_restore_ = false;
++        auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
++        std::tm tm_buf{};
++#ifdef _WIN32
++        localtime_s(&tm_buf, &now);
++#else
++        localtime_r(&now, &tm_buf);
++#endif
++        char stamp[32];
++        std::strftime(stamp, sizeof(stamp), "%Y-%m-%d_%H-%M-%S", &tm_buf);
++        std::string err;
++        if (CopySaves(saves_dir_, backups / stamp, &err)) {
++          save_status_ = "Backed up to " + backups.filename().string() + "\\" + stamp;
++        } else {
++          save_status_ = "Backup failed: " + err;
++        }
++        REXLOG_INFO("Saves: {}", save_status_);
++      }
++      ImGui::SameLine();
++      if (ImGui::Button("Restore latest"))
++        confirm_restore_ = true;
++      ImGui::SameLine();
++      if (ImGui::Button("Open saves folder")) {
++#ifdef _WIN32
++        ShellExecuteW(nullptr, L"open", saves_dir_.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
++#endif
++      }
++      if (confirm_restore_) {
++        std::filesystem::path latest;
++        for (auto& e : std::filesystem::directory_iterator(backups, ec)) {
++          if (e.is_directory(ec) && (latest.empty() || e.path().filename() > latest.filename()))
++            latest = e.path();
++        }
++        if (latest.empty()) {
++          save_status_ = "No backups found.";
++          confirm_restore_ = false;
++        } else {
++          ImGui::TextColored(imgui_drawer()->style().settings.warning,
++                             "Overwrite current saves with %s?", latest.filename().string().c_str());
++          if (ImGui::Button("Yes, restore")) {
++            std::string err;
++            if (CopySaves(latest, saves_dir_, &err))
++              save_status_ = "Restored " + latest.filename().string() +
++                             ". Restart the game to load it.";
++            else
++              save_status_ = "Restore failed: " + err;
++            REXLOG_INFO("Saves: {}", save_status_);
++            confirm_restore_ = false;
++          }
++          ImGui::SameLine();
++          if (ImGui::Button("Cancel"))
++            confirm_restore_ = false;
++        }
++      }
++      if (!save_status_.empty())
++        ImGui::TextDisabled("%s", save_status_.c_str());
++    }
++  }
++
++  // What the config currently says.
++  {
++    const int w = std::atoi(rex::cvar::GetFlagByName("window_width").c_str());
++    const int h = std::atoi(rex::cvar::GetFlagByName("window_height").c_str());
++    const int sc = std::atoi(rex::cvar::GetFlagByName("resolution_scale").c_str());
++    ImGui::Spacing();
++    ImGui::TextDisabled("Config: render %dp (%dx scale), window %dx%d", 720 * sc, sc, w, h);
++  }
++
++  if (on_quit_) {
++    ImGui::Spacing();
++    if (ImGui::Button("Quit game", ImVec2(140.0f, 0)))
++      on_quit_();
++    ImGui::SameLine();
++    ImGui::TextDisabled("F4 / B / Back+Start closes this menu");
++  }
++  ImGui::Spacing();
++}
++
++void SettingsDialog::OnDraw(ImGuiIO& io) {
++  // B (or Escape) closes the menu, unless it just closed a combo popup.
++  if ((ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) ||
++       ImGui::IsKeyPressed(ImGuiKey_Escape, false)) &&
++      !popup_open_prev_ && !io.WantTextInput && capturing_bind_name_.empty() && on_close_) {
++    on_close_();
++  }
++  struct PopupTracker {
++    bool& flag;
++    ~PopupTracker() {
++      flag = ImGui::IsPopupOpen(nullptr,
++                                ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
++    }
++  } popup_tracker{popup_open_prev_};
++
+   auto& registry = rex::cvar::GetRegistry();
+ 
+   // Collect sorted unique category paths.
+@@ -199,13 +508,19 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
+   const std::string search(search_buf_);
+   const bool searching = !search.empty();
+ 
+-  ImGui::SetNextWindowSize(ImVec2(620, 480), ImGuiCond_FirstUseEver);
++  ImGui::SetNextWindowSize(ImVec2(640, 560), ImGuiCond_FirstUseEver);
+   ImGui::SetNextWindowBgAlpha(0.85f);
+   if (!ImGui::Begin("Settings##rex", nullptr, ImGuiWindowFlags_NoCollapse)) {
+     ImGui::End();
+     return;
+   }
+ 
++  DrawQuickSettings();
++  if (!ImGui::CollapsingHeader("All engine settings (advanced)")) {
++    ImGui::End();
++    return;
++  }
++
+   // Search bar at the top (full width).
+   ImGui::SetNextItemWidth(-1.0f);
+   ImGui::InputText("##search", search_buf_, sizeof(search_buf_));
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index b94fe9e..5b423d2 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -20,6 +20,7 @@
+ #include <rex/filesystem.h>
+ #include <rex/logging/sink.h>
+ #include <rex/logging.h>
++#include <rex/audio/audio_driver.h>
+ #include <rex/ui/overlay/achievement_toast.h>
+ #include <rex/ui/overlay/achievements_overlay.h>
+ #include <rex/ui/overlay/console_overlay.h>
+@@ -51,6 +52,142 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
+                       "GPU emulation")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++#if REX_PLATFORM_WIN32
++#include <atomic>
++#include <csignal>
++#include <Windows.h>
++#include <DbgHelp.h>
++#pragma comment(lib, "dbghelp.lib")
++#endif
++
++REXCVAR_DEFINE_BOOL(pause_on_focus_loss, true, "Window",
++                    "Mute audio and ignore pad input while the window is not focused")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_BOOL(crash_dumps, true, "Runtime",
++                    "On a host crash, log a stack trace and write a minidump to crashdumps\\");
++
++#if REX_PLATFORM_WIN32
++namespace {
++
++std::filesystem::path g_crash_dump_dir;
++std::atomic<bool> g_crash_handled{false};
++
++void LogStackTrace(CONTEXT* context) {
++  HANDLE process = GetCurrentProcess();
++  SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
++  SymInitialize(process, nullptr, TRUE);
++
++  CONTEXT ctx = *context;
++  STACKFRAME64 frame = {};
++  frame.AddrPC.Offset = ctx.Rip;
++  frame.AddrPC.Mode = AddrModeFlat;
++  frame.AddrFrame.Offset = ctx.Rbp;
++  frame.AddrFrame.Mode = AddrModeFlat;
++  frame.AddrStack.Offset = ctx.Rsp;
++  frame.AddrStack.Mode = AddrModeFlat;
++
++  alignas(SYMBOL_INFO) char symbol_buffer[sizeof(SYMBOL_INFO) + 256];
++  auto* symbol = reinterpret_cast<SYMBOL_INFO*>(symbol_buffer);
++  for (int i = 0; i < 48; ++i) {
++    if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, process, GetCurrentThread(), &frame, &ctx, nullptr,
++                     SymFunctionTableAccess64, SymGetModuleBase64, nullptr) ||
++        !frame.AddrPC.Offset) {
++      break;
++    }
++    DWORD64 address = frame.AddrPC.Offset;
++    std::memset(symbol_buffer, 0, sizeof(symbol_buffer));
++    symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
++    symbol->MaxNameLen = 255;
++    DWORD64 symbol_offset = 0;
++    IMAGEHLP_LINE64 line = {sizeof(IMAGEHLP_LINE64)};
++    DWORD line_offset = 0;
++    bool has_symbol = SymFromAddr(process, address, &symbol_offset, symbol);
++    bool has_line = SymGetLineFromAddr64(process, address, &line_offset, &line);
++    REXLOG_CRITICAL("  #{:02} {:016X} {}+0x{:X} {}:{}", i, address,
++                    has_symbol ? symbol->Name : "?", symbol_offset,
++                    has_line ? line.FileName : "", has_line ? line.LineNumber : 0);
++  }
++}
++
++void WriteMiniDump(EXCEPTION_POINTERS* exception_pointers) {
++  std::error_code ec;
++  std::filesystem::create_directories(g_crash_dump_dir, ec);
++  SYSTEMTIME t;
++  GetLocalTime(&t);
++  wchar_t name[64];
++  swprintf_s(name, L"crash_%04u%02u%02u_%02u%02u%02u.dmp", t.wYear, t.wMonth, t.wDay, t.wHour,
++             t.wMinute, t.wSecond);
++  auto path = g_crash_dump_dir / name;
++  HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
++                            FILE_ATTRIBUTE_NORMAL, nullptr);
++  if (file == INVALID_HANDLE_VALUE) {
++    return;
++  }
++  MINIDUMP_EXCEPTION_INFORMATION info = {GetCurrentThreadId(), exception_pointers, FALSE};
++  // Stacks and thread state only: the guest memory arena is far too large to include.
++  auto type = MINIDUMP_TYPE(MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithThreadInfo |
++                            MiniDumpWithUnloadedModules);
++  if (MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), file, type,
++                        exception_pointers ? &info : nullptr, nullptr, nullptr)) {
++    REXLOG_CRITICAL("Minidump written to {}", path.string());
++  }
++  CloseHandle(file);
++}
++
++LONG WINAPI UnhandledExceptionCallback(EXCEPTION_POINTERS* exception_pointers) {
++  if (g_crash_handled.exchange(true)) {
++    return EXCEPTION_CONTINUE_SEARCH;
++  }
++  const EXCEPTION_RECORD* record = exception_pointers->ExceptionRecord;
++  HMODULE module = nullptr;
++  char module_path[MAX_PATH] = "?";
++  if (GetModuleHandleExA(
++          GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++          static_cast<LPCSTR>(record->ExceptionAddress), &module)) {
++    GetModuleFileNameA(module, module_path, MAX_PATH);
++  }
++  REXLOG_CRITICAL("Unhandled host exception 0x{:08X} at {:016X} ({}+0x{:X}) on thread {}",
++                  uint32_t(record->ExceptionCode),
++                  reinterpret_cast<uintptr_t>(record->ExceptionAddress),
++                  std::filesystem::path(module_path).filename().string(),
++                  reinterpret_cast<uintptr_t>(record->ExceptionAddress) -
++                      reinterpret_cast<uintptr_t>(module),
++                  GetCurrentThreadId());
++  if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2) {
++    REXLOG_CRITICAL("  {} of address {:016X}",
++                    record->ExceptionInformation[0] == 1   ? "write"
++                    : record->ExceptionInformation[0] == 8 ? "execute"
++                                                           : "read",
++                    record->ExceptionInformation[1]);
++  }
++  LogStackTrace(exception_pointers->ContextRecord);
++  WriteMiniDump(exception_pointers);
++  rex::ShutdownLogging();
++  return EXCEPTION_CONTINUE_SEARCH;
++}
++
++void AbortSignalHandler(int) {
++  if (g_crash_handled.exchange(true)) {
++    return;
++  }
++  CONTEXT context;
++  RtlCaptureContext(&context);
++  REXLOG_CRITICAL("abort() called on thread {}", GetCurrentThreadId());
++  LogStackTrace(&context);
++  WriteMiniDump(nullptr);
++  rex::ShutdownLogging();
++}
++
++void InstallCrashHandler(const std::filesystem::path& dump_dir) {
++  g_crash_dump_dir = dump_dir;
++  SetUnhandledExceptionFilter(UnhandledExceptionCallback);
++  std::signal(SIGABRT, AbortSignalHandler);
++}
++
++}  // namespace
++#endif
++
+ namespace rex {
+ 
+ // --- ReXApp ---
+@@ -182,6 +319,12 @@ bool ReXApp::SetupEnvironment() {
+   if (std::filesystem::exists(config_path_))
+     REXLOG_DEBUG("Loaded config: {}", config_path_.filename().string());
+ 
++#if REX_PLATFORM_WIN32
++  if (REXCVAR_GET(crash_dumps)) {
++    InstallCrashHandler(exe_dir / "crashdumps");
++  }
++#endif
++
+   REXLOG_DEBUG("{} starting", GetName());
+   if (!game_data_root_.empty()) {
+     REXLOG_DEBUG("  Game directory: {}", game_data_root_.string());
+@@ -252,9 +395,30 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+     auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system());
+     if (input_sys) {
+       input_sys->SetActiveCallback([this]() {
++        // Release the mouse (show the cursor) whenever any overlay is open.
+         if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_)
+           return true;
+-        return !imgui_drawer_->GetIO().WantCaptureMouse;
++        return false;
++      });
++      // Pad: Back+Start toggles the F4 overlay; while it is open the pad drives
++      // the overlay (ImGui nav) and is hidden from the game.
++      input_sys->SetPadHook([this](const rex::input::X_INPUT_GAMEPAD& pad) {
++        const uint16_t b = pad.buttons;
++        constexpr uint16_t kCombo =
++            rex::input::X_INPUT_GAMEPAD_BACK | rex::input::X_INPUT_GAMEPAD_START;
++        const bool combo = (b & kCombo) == kCombo;
++        const bool was_combo = pad_combo_down_.exchange(combo);
++        if (combo && !was_combo && toggle_settings_) {
++          REXLOG_INFO("Pad: Back+Start toggles settings overlay");
++          app_context().CallInUIThreadDeferred([this] { toggle_settings_(); });
++        }
++        const bool open = settings_overlay_ != nullptr;
++        if (open) {
++          imgui_drawer_->SetGamepadInput(true, combo ? 0 : b, pad.thumb_lx, pad.thumb_ly);
++        }
++        // Hide the pad while open and while the combo is held (so the game
++        // never sees Back/Start of the toggle press).
++        return open || combo;
+       });
+     }
+   }
+@@ -409,12 +573,36 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
+       console_overlay_ = std::make_unique<ui::ConsoleDialog>(imgui_drawer_.get(), log_sink_);
+     }
+   });
+-  rex::ui::RegisterBind("bind_settings", "F4", "Toggle settings overlay", [this] {
++  toggle_settings_ = [this] {
+     if (settings_overlay_) {
+       settings_overlay_.reset();
++      imgui_drawer_->SetGamepadInput(false, 0, 0, 0);
+     } else {
+-      settings_overlay_ = std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_);
++      settings_overlay_ = std::make_unique<ui::SettingsDialog>(
++          imgui_drawer_.get(), config_path_, [this] {
++            // Deferred so the window isn't closed while the overlay is drawing.
++            app_context().CallInUIThreadDeferred([this] {
++              if (window_)
++                window_->RequestClose();
++            });
++          });
++      settings_overlay_->set_saves_dir(user_data_root_);
++      settings_overlay_->set_on_close([this] {
++        // Deferred: the dialog must not be destroyed while it is drawing.
++        app_context().CallInUIThreadDeferred([this] {
++          if (settings_overlay_) {
++            settings_overlay_.reset();
++            imgui_drawer_->SetGamepadInput(false, 0, 0, 0);
++          }
++        });
++      });
+     }
++  };
++  rex::ui::RegisterBind("bind_settings", "F4", "Toggle settings overlay",
++                        [this] { toggle_settings_(); });
++  rex::ui::RegisterBind("bind_fullscreen", "F11", "Toggle fullscreen", [] {
++    const bool now = rex::string::from_string<bool>(rex::cvar::GetFlagByName("fullscreen"), false);
++    rex::cvar::SetFlagByName("fullscreen", now ? "false" : "true");
+   });
+   rex::ui::RegisterBind("bind_achievements", "F7", "Toggle achievements overlay", [this] {
+     if (achievements_overlay_) {
+@@ -533,13 +721,25 @@ void ReXApp::OnDpiChanged(ui::UISetupEvent& e) {
+   OnDpiScaleChanged(float(window_->GetDpi()) / float(window_->GetMediumDpi()));
+ }
+ 
++// Alt-tab: mute audio and hide the pad from the game (no thread suspend). Kept in
++// the runtime DLL so the flags are the same instances the audio/input code reads.
++static void ApplyFocusBlock(bool focused) {
++  const bool block = !focused && REXCVAR_GET(pause_on_focus_loss);
++  rex::audio::g_audio_muted.store(block);
++  rex::input::g_input_blocked.store(block);
++  REXLOG_INFO("Window {}: audio {} / pad {}", focused ? "focused" : "unfocused",
++              block ? "muted" : "on", block ? "ignored" : "active");
++}
++
+ void ReXApp::OnGotFocus(ui::UISetupEvent& e) {
+   (void)e;
++  ApplyFocusBlock(true);
+   OnWindowFocusChanged(true);
+ }
+ 
+ void ReXApp::OnLostFocus(ui::UISetupEvent& e) {
+   (void)e;
++  ApplyFocusBlock(false);
+   OnWindowFocusChanged(false);
+ }
+ 
+@@ -561,6 +761,7 @@ void ReXApp::OnDestroy() {
+   rex::ui::UnregisterBind("bind_debug_overlay");
+   rex::ui::UnregisterBind("bind_console");
+   rex::ui::UnregisterBind("bind_settings");
++  rex::ui::UnregisterBind("bind_fullscreen");
+   rex::ui::UnregisterBind("bind_achievements");
+ 
+   // ImGui cleanup (reverse of setup)
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 23645ef..db5239e 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -15,6 +15,7 @@
+ #include <cstdint>
+ #include <cmath>
+ #include <cstring>
++#include <string>
+ #include <memory>
+ #include <utility>
+ #include <vector>
+@@ -1381,7 +1382,13 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
+   // interfering with GPU command processing, and also to allow tearing so
+   // variable refresh rate may be used where it's available.
+   // Note: If the priorities here are changes, update the cvar descriptions.
+-  if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
++  // SVR07: honor the user's vsync setting (upstream always preferred IMMEDIATE, so vsync did
++  // nothing on Vulkan and the presenter ran uncapped).
++  const std::string vsync_value = rex::cvar::GetFlagByName("vsync");
++  const bool host_vsync = !(vsync_value == "false" || vsync_value == "0");
++  if (host_vsync) {
++    swapchain_create_info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
++  } else if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
+       std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_IMMEDIATE_KHR) !=
+           present_modes.cend()) {
+     // Allowing tearing to reduce latency, and possibly variable refresh rate
+diff --git a/src/ui/windowed_app_context_sdl.cpp b/src/ui/windowed_app_context_sdl.cpp
+index dc0b4c2..8b66b81 100644
+--- a/src/ui/windowed_app_context_sdl.cpp
++++ b/src/ui/windowed_app_context_sdl.cpp
+@@ -139,7 +139,14 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
+       break;
+     case SDL_EVENT_KEY_DOWN:
+     case SDL_EVENT_KEY_UP: {
+-      if (WindowSDL* window = GetWindow(event.key.windowID)) {
++      WindowSDL* window = GetWindow(event.key.windowID);
++      // SDL tags key events with the keyboard-focus window, so keys posted to
++      // an unfocused window arrive with no window (scripted testing with
++      // mnk_ignore_focus). With a single window there is only one target.
++      if (!window && event.key.windowID == 0 && windows_.size() == 1) {
++        window = windows_.begin()->second;
++      }
++      if (window) {
+         window->HandleKeyEvent(event);
+       }
+       break;

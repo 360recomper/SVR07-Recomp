@@ -4,6 +4,17 @@
 
 # SVR07-Recomp
 
+> **This fork: Vulkan update (SDK v0.10).** Download it from the [Releases page](../../releases).
+> - The random "exploding wrestler model" glitches came from the Direct3D 12 renderer. This build uses **Vulkan** by default, and they're gone.
+> - Smooth 60 fps frame pacing, an **F4** in-game menu (resolution, backend, fullscreen, vsync, sharpening, save backup/restore, Quit), and controller support for the menu (**Back + Start**).
+> - Ported to ReXGlue SDK **v0.10.0**. The engine changes are in [`sdk-patch/rexglue-sdk-v0.10-svr07.patch`](sdk-patch/rexglue-sdk-v0.10-svr07.patch).
+>
+> **Building this fork:** clone upstream [rexglue-sdk](https://github.com/rexglue/rexglue-sdk) at tag `v0.10.0`, run `git apply` with the patch above, then build and install it (`win-amd64-release` preset, `--target install`).
+> Then, in this repo: `rexglue codegen svr07_manifest.toml`, configure with `-DCMAKE_PREFIX_PATH=<sdk>/out/install/win-amd64` and build. The original build instructions below are for the old v1.0 engine.
+>
+> Original recomp by HollywoodAkeem. All credit for the recompilation goes to them.
+
+
 A static recompilation of **WWE SmackDown vs. Raw 2007** (Xbox 360) that runs natively on Windows.
 
 Built on top of [RexGlue](https://github.com/HollywoodAkeem/rexglue-sdk-yukes), an Xbox 360 PPC-to-x64 recompilation runtime.
