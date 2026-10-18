@@ -1,0 +1,35 @@
+# Hand-written roster-expansion hooks (see docs/ROSTER_EXPANSION.md). The per-site
+# `cmp id,93` hooks are generated: config/roster_midasm.toml.
+
+# Select list (sub_822F8C08): each brand/mode loop ends in `cmpw cr6,r31,r28` (id vs 93
+# or 123); r23 counts entries. The hook carries the loop on through the extra ids.
+[[midasm_hook]]
+address = 0x822F8D40
+name = "RosterSelectListLoop"
+registers = ["cr6", "r31", "r28", "r23"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x822F8DFC
+name = "RosterSelectListLoop"
+registers = ["cr6", "r31", "r28", "r23"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x822F8E9C
+name = "RosterSelectListLoop"
+registers = ["cr6", "r31", "r28", "r23"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x822F8F5C
+name = "RosterSelectListLoop"
+registers = ["cr6", "r31", "r28", "r23"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x822F9018
+name = "RosterSelectListLoop"
+registers = ["cr6", "r31", "r28", "r23"]
+after_instruction = true
+

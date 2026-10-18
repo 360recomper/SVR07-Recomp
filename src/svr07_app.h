@@ -11,6 +11,7 @@
 #include <rex/system/gpu_plugin.h>
 
 #include "svr07_portraits.h"
+#include "svr07_roster.h"
 
 REXCVAR_DEFINE_STRING(gpu_backend, "vulkan", "GPU",
                       "Graphics backend: vulkan (recommended) or d3d12 (skinned-model glitches)");
@@ -71,6 +72,10 @@ class Svr07App : public rex::ReXApp {
     // Before the game files are mounted: merge mods\portraits into the
     // select-screen banks and rebuild plist360.arc if it's stale (both are
     // laid over the game's files).
+    // mods/roster first: it lists its model pac in plist360.h, which the index
+    // rebuild below reads.
+    svr07::roster::BuildRosterFiles(defaults.game_data_root, rex::Runtime::ResolveModsRoot(),
+                                    defaults.cache_root / "mods_generated");
     svr07::PreparePortraits(defaults.game_data_root, defaults.cache_root);
     return defaults;
   }

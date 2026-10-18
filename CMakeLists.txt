@@ -11,6 +11,7 @@ set(SVR07_SOURCES
   src/main.cpp
   src/svr07_hooks.cpp
   src/svr07_portraits.cpp
+  src/svr07_roster.cpp
 )
 
 if(WIN32)

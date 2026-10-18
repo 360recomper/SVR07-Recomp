@@ -1,0 +1,21 @@
+# Policy for the `cmp id,93` sites (tools/roster_sites.py). One per line:
+#   <function or address>  <roster|observe|off>   # why
+# A site's own address (8 hex digits) wins over its function. Not listed = roster:
+# an extra id compares like a roster id, and the first hit at each site is logged.
+
+# Not ids: text parsers comparing a character with ']' (93).
+sub_82565E98 off   # printf-style format parser
+sub_82618ED8 off   # character class parser
+sub_826265B0 off   # parser (byte from a string)
+# Unknown value ([obj+4]->[0]); log only until reviewed.
+sub_82168C88 observe
+
+# Model-number compares (`cmp n,10000`: 10000 and up = a CAW model). Only these
+# functions: elsewhere 9999/10000 are counter caps and other ranges.
+model sub_820D5A28   # model load list: < 10000 -> /EMD/%04d, else CAW build
+model sub_820D5D50   # same list, second pass
+model sub_82153798
+model sub_824AD620
+model sub_824AF700
+model sub_824B6390
+model sub_82709A50

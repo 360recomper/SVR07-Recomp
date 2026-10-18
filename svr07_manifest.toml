@@ -9,6 +9,8 @@ out_directory_path = "generated/default"
 includes = [
   "config/functions.toml",
   "config/v010_seeds.toml",
+  "config/roster_midasm.toml",
+  "config/roster_manual.toml",
 ]
 # CRT setjmp/longjmp (jmp_buf: f14-f31 @0, r1 @144, r13-r31 @152, CR @304, LR @308).
 # Without these, setjmp's register-saving body is never recompiled (the analyzer
