@@ -10,6 +10,8 @@
 #include <rex/rex_app.h>
 #include <rex/system/gpu_plugin.h>
 
+#include "svr07_portraits.h"
+
 REXCVAR_DEFINE_STRING(gpu_backend, "vulkan", "GPU",
                       "Graphics backend: vulkan (recommended) or d3d12 (skinned-model glitches)");
 
@@ -61,6 +63,16 @@ class Svr07App : public rex::ReXApp {
         config.gpu_plugin = "xenos";
       }
     }
+  }
+
+  std::optional<rex::PathConfig> OnFinalizePaths(
+      const rex::PathConfig& defaults, std::function<void(rex::PathConfig)> resume) override {
+    (void)resume;
+    // Before the game files are mounted: merge mods\portraits into the
+    // select-screen banks and rebuild plist360.arc if it's stale (both are
+    // laid over the game's files).
+    svr07::PreparePortraits(defaults.game_data_root, defaults.cache_root);
+    return defaults;
   }
 
   // Override virtual hooks for customization:

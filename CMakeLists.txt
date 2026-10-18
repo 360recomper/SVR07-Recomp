@@ -10,6 +10,7 @@ include(generated/rexglue.cmake)
 set(SVR07_SOURCES
   src/main.cpp
   src/svr07_hooks.cpp
+  src/svr07_portraits.cpp
 )
 
 if(WIN32)
@@ -19,3 +20,6 @@ else()
 endif()
 
 rexglue_setup_target(svr07 GPU_PLUGINS xenos)
+# Command-line build of the portrait-merged menu pacs (same code as the game).
+add_executable(svr07_portraits src/svr07_portraits.cpp src/svr07_portraits_tool.cpp)
+target_link_libraries(svr07_portraits PRIVATE rex::runtime)

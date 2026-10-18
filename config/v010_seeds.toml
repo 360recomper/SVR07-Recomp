@@ -6,3 +6,6 @@
 0x822EDBA0 = { name = "sub_822EDBA0" }
 0x8242C948 = { name = "sub_8242C948" }
 0x8242CB20 = { name = "sub_8242CB20" }
+# Tiny pointer-only function after sub_8258C230 (no caller, so neither analyzer
+# found it). First reached when booting with the UE 2.5 mod's files.
+0x8258C340 = { name = "sub_8258C340" }
