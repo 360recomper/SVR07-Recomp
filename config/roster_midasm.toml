@@ -4949,3 +4949,311 @@ registers = ["cr6", "r10"]
 after_instruction = true
 # sub_824AF700: cmplwi cr6,r10,10000
 
+[[midasm_hook]]
+address = 0x8250813C
+name = "RosterProfile_8250813C"
+registers = ["r11", "r10"]
+after_instruction = true
+# sub_825080A8: mulli r11,r10,412
+
+[[midasm_hook]]
+address = 0x82508198
+name = "RosterProfile_82508198"
+registers = ["r11", "r10"]
+after_instruction = true
+# sub_825080A8: mulli r11,r10,412
+
+[[midasm_hook]]
+address = 0x825081F4
+name = "RosterProfile_825081F4"
+registers = ["r11", "r10"]
+after_instruction = true
+# sub_825080A8: mulli r11,r10,412
+
+[[midasm_hook]]
+address = 0x8250824C
+name = "RosterProfile_8250824C"
+registers = ["r11", "r10"]
+after_instruction = true
+# sub_825080A8: mulli r11,r10,412
+
+[[midasm_hook]]
+address = 0x82508280
+name = "RosterProfile_82508280"
+registers = ["r11"]
+after_instruction = false
+# sub_825080A8: mulli r11,r11,412
+
+[[midasm_hook]]
+address = 0x825082FC
+name = "RosterProfile_825082FC"
+registers = ["r11", "r10"]
+after_instruction = true
+# sub_825080A8: mulli r11,r10,412
+
+[[midasm_hook]]
+address = 0x82508350
+name = "RosterProfile_82508350"
+registers = ["r11", "r10"]
+after_instruction = true
+# sub_825080A8: mulli r11,r10,412
+
+[[midasm_hook]]
+address = 0x824FED40
+name = "RosterProfile_824FED40"
+registers = ["r11"]
+after_instruction = false
+# sub_824FECD8: mulli r11,r11,412
+
+[[midasm_hook]]
+address = 0x824FED90
+name = "RosterProfile_824FED90"
+registers = ["r11", "r10"]
+after_instruction = true
+# sub_824FECD8: mulli r11,r10,412
+
+[[midasm_hook]]
+address = 0x824FEDE4
+name = "RosterProfile_824FEDE4"
+registers = ["r11", "r10"]
+after_instruction = true
+# sub_824FECD8: mulli r11,r10,412
+
+[[midasm_hook]]
+address = 0x82500D50
+name = "RosterProfile_82500D50"
+registers = ["r11"]
+after_instruction = false
+# sub_82500B08: mulli r11,r11,412
+
+[[midasm_hook]]
+address = 0x82500D68
+name = "RosterProfile_82500D68"
+registers = ["r10", "r11"]
+after_instruction = true
+# sub_82500B08: mulli r10,r11,412
+
+[[midasm_hook]]
+address = 0x82500DA4
+name = "RosterProfile_82500DA4"
+registers = ["r11"]
+after_instruction = false
+# sub_82500B08: mulli r11,r11,412
+
+[[midasm_hook]]
+address = 0x82500DC8
+name = "RosterProfile_82500DC8"
+registers = ["r10"]
+after_instruction = false
+# sub_82500B08: mulli r10,r10,412
+
+[[midasm_hook]]
+address = 0x82500DF8
+name = "RosterProfile_82500DF8"
+registers = ["r11", "r9"]
+after_instruction = true
+# sub_82500B08: mulli r11,r9,412
+
+[[midasm_hook]]
+address = 0x82500E20
+name = "RosterProfile_82500E20"
+registers = ["r11"]
+after_instruction = false
+# sub_82500B08: mulli r11,r11,412
+
+[[midasm_hook]]
+address = 0x82500E50
+name = "RosterProfile_82500E50"
+registers = ["r11"]
+after_instruction = false
+# sub_82500B08: mulli r11,r11,412
+
+[[midasm_hook]]
+address = 0x82500E74
+name = "RosterProfile_82500E74"
+registers = ["r11"]
+after_instruction = false
+# sub_82500B08: mulli r11,r11,412
+
+[[midasm_hook]]
+address = 0x82500EA4
+name = "RosterProfile_82500EA4"
+registers = ["r11"]
+after_instruction = false
+# sub_82500B08: mulli r11,r11,412
+
+[[midasm_hook]]
+address = 0x82500A14
+name = "RosterProfile_82500A14"
+registers = ["r10"]
+after_instruction = false
+# sub_82500730: mulli r10,r10,412
+
+[[midasm_hook]]
+address = 0x82709808
+name = "RosterProfile_82709808"
+registers = ["r11"]
+after_instruction = false
+# sub_827097D8: mulli r11,r11,412
+
+[[midasm_hook]]
+address = 0x82709828
+name = "RosterProfile_82709828"
+registers = ["r11"]
+after_instruction = false
+# sub_827097D8: mulli r11,r11,412
+
+[[midasm_hook]]
+address = 0x8270983C
+name = "RosterProfile_8270983C"
+registers = ["r11"]
+after_instruction = false
+# sub_827097D8: mulli r11,r11,412
+
+[[midasm_hook]]
+address = 0x8270985C
+name = "RosterProfile_8270985C"
+registers = ["r11"]
+after_instruction = false
+# sub_827097D8: mulli r11,r11,412
+
+[[midasm_hook]]
+address = 0x82709874
+name = "RosterProfile_82709874"
+registers = ["r10"]
+after_instruction = false
+# sub_827097D8: mulli r10,r10,412
+
+[[midasm_hook]]
+address = 0x8246A654
+name = "RosterProfile_8246A654"
+registers = ["r11", "r30"]
+after_instruction = true
+# sub_8246A2F8: mulli r11,r30,412
+
+[[midasm_hook]]
+address = 0x82510BB8
+name = "RosterProfile_82510BB8"
+registers = ["r11"]
+after_instruction = false
+# sub_825108B0: mulli r11,r11,412
+
+[[midasm_hook]]
+address = 0x82510BD4
+name = "RosterProfile_82510BD4"
+registers = ["r11"]
+after_instruction = false
+# sub_825108B0: mulli r11,r11,412
+
+[[midasm_hook]]
+address = 0x82510BF8
+name = "RosterProfile_82510BF8"
+registers = ["r11"]
+after_instruction = false
+# sub_825108B0: mulli r11,r11,412
+
+[[midasm_hook]]
+address = 0x82510C48
+name = "RosterProfile_82510C48"
+registers = ["r11"]
+after_instruction = false
+# sub_825108B0: mulli r11,r11,412
+
+[[midasm_hook]]
+address = 0x82510C80
+name = "RosterProfile_82510C80"
+registers = ["r11", "r9"]
+after_instruction = true
+# sub_825108B0: mulli r11,r9,412
+
+[[midasm_hook]]
+address = 0x82510CA0
+name = "RosterProfile_82510CA0"
+registers = ["r11"]
+after_instruction = false
+# sub_825108B0: mulli r11,r11,412
+
+[[midasm_hook]]
+address = 0x82510CC0
+name = "RosterProfile_82510CC0"
+registers = ["r11"]
+after_instruction = false
+# sub_825108B0: mulli r11,r11,412
+
+[[midasm_hook]]
+address = 0x82510CEC
+name = "RosterProfile_82510CEC"
+registers = ["r11"]
+after_instruction = false
+# sub_825108B0: mulli r11,r11,412
+
+[[midasm_hook]]
+address = 0x82510D20
+name = "RosterProfile_82510D20"
+registers = ["r11", "r9"]
+after_instruction = true
+# sub_825108B0: mulli r11,r9,412
+
+[[midasm_hook]]
+address = 0x82510D4C
+name = "RosterProfile_82510D4C"
+registers = ["r11"]
+after_instruction = false
+# sub_825108B0: mulli r11,r11,412
+
+[[midasm_hook]]
+address = 0x82510D80
+name = "RosterProfile_82510D80"
+registers = ["r11"]
+after_instruction = false
+# sub_825108B0: mulli r11,r11,412
+
+[[midasm_hook]]
+address = 0x82510DA8
+name = "RosterProfile_82510DA8"
+registers = ["r11"]
+after_instruction = false
+# sub_825108B0: mulli r11,r11,412
+
+[[midasm_hook]]
+address = 0x82510DE0
+name = "RosterProfile_82510DE0"
+registers = ["r11"]
+after_instruction = false
+# sub_825108B0: mulli r11,r11,412
+
+[[midasm_hook]]
+address = 0x82510E18
+name = "RosterProfile_82510E18"
+registers = ["r11"]
+after_instruction = false
+# sub_825108B0: mulli r11,r11,412
+
+[[midasm_hook]]
+address = 0x82510E48
+name = "RosterProfile_82510E48"
+registers = ["r11"]
+after_instruction = false
+# sub_825108B0: mulli r11,r11,412
+
+[[midasm_hook]]
+address = 0x82510E6C
+name = "RosterProfile_82510E6C"
+registers = ["r11"]
+after_instruction = false
+# sub_825108B0: mulli r11,r11,412
+
+[[midasm_hook]]
+address = 0x82510E9C
+name = "RosterProfile_82510E9C"
+registers = ["r11"]
+after_instruction = false
+# sub_825108B0: mulli r11,r11,412
+
+[[midasm_hook]]
+address = 0x82510EB8
+name = "RosterProfile_82510EB8"
+registers = ["r11"]
+after_instruction = false
+# sub_825108B0: mulli r11,r11,412
+

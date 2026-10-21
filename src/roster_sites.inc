@@ -707,3 +707,47 @@ void RosterModelCmp_824B6444(PPCCRRegister& cr, PPCRegister& r) { svr07::roster:
 void RosterModelCmp_820D5DA4(PPCCRRegister& cr, PPCRegister& r) { svr07::roster::OnModelCompare(0x820D5DA4, cr, r); }
 void RosterModelCmp_82709A8C(PPCCRRegister& cr, PPCRegister& r) { svr07::roster::OnModelCompare(0x82709A8C, cr, r); }
 void RosterModelCmp_824AF74C(PPCCRRegister& cr, PPCRegister& r) { svr07::roster::OnModelCompare(0x824AF74C, cr, r); }
+void RosterProfile_8250813C(PPCRegister& product, PPCRegister& id) { svr07::roster::OnProfileIndexAfter(0x8250813C, product, id); }
+void RosterProfile_82508198(PPCRegister& product, PPCRegister& id) { svr07::roster::OnProfileIndexAfter(0x82508198, product, id); }
+void RosterProfile_825081F4(PPCRegister& product, PPCRegister& id) { svr07::roster::OnProfileIndexAfter(0x825081F4, product, id); }
+void RosterProfile_8250824C(PPCRegister& product, PPCRegister& id) { svr07::roster::OnProfileIndexAfter(0x8250824C, product, id); }
+void RosterProfile_82508280(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82508280, id); }
+void RosterProfile_825082FC(PPCRegister& product, PPCRegister& id) { svr07::roster::OnProfileIndexAfter(0x825082FC, product, id); }
+void RosterProfile_82508350(PPCRegister& product, PPCRegister& id) { svr07::roster::OnProfileIndexAfter(0x82508350, product, id); }
+void RosterProfile_824FED40(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x824FED40, id); }
+void RosterProfile_824FED90(PPCRegister& product, PPCRegister& id) { svr07::roster::OnProfileIndexAfter(0x824FED90, product, id); }
+void RosterProfile_824FEDE4(PPCRegister& product, PPCRegister& id) { svr07::roster::OnProfileIndexAfter(0x824FEDE4, product, id); }
+void RosterProfile_82500D50(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82500D50, id); }
+void RosterProfile_82500D68(PPCRegister& product, PPCRegister& id) { svr07::roster::OnProfileIndexAfter(0x82500D68, product, id); }
+void RosterProfile_82500DA4(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82500DA4, id); }
+void RosterProfile_82500DC8(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82500DC8, id); }
+void RosterProfile_82500DF8(PPCRegister& product, PPCRegister& id) { svr07::roster::OnProfileIndexAfter(0x82500DF8, product, id); }
+void RosterProfile_82500E20(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82500E20, id); }
+void RosterProfile_82500E50(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82500E50, id); }
+void RosterProfile_82500E74(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82500E74, id); }
+void RosterProfile_82500EA4(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82500EA4, id); }
+void RosterProfile_82500A14(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82500A14, id); }
+void RosterProfile_82709808(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82709808, id); }
+void RosterProfile_82709828(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82709828, id); }
+void RosterProfile_8270983C(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x8270983C, id); }
+void RosterProfile_8270985C(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x8270985C, id); }
+void RosterProfile_82709874(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82709874, id); }
+void RosterProfile_8246A654(PPCRegister& product, PPCRegister& id) { svr07::roster::OnProfileIndexAfter(0x8246A654, product, id); }
+void RosterProfile_82510BB8(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82510BB8, id); }
+void RosterProfile_82510BD4(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82510BD4, id); }
+void RosterProfile_82510BF8(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82510BF8, id); }
+void RosterProfile_82510C48(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82510C48, id); }
+void RosterProfile_82510C80(PPCRegister& product, PPCRegister& id) { svr07::roster::OnProfileIndexAfter(0x82510C80, product, id); }
+void RosterProfile_82510CA0(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82510CA0, id); }
+void RosterProfile_82510CC0(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82510CC0, id); }
+void RosterProfile_82510CEC(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82510CEC, id); }
+void RosterProfile_82510D20(PPCRegister& product, PPCRegister& id) { svr07::roster::OnProfileIndexAfter(0x82510D20, product, id); }
+void RosterProfile_82510D4C(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82510D4C, id); }
+void RosterProfile_82510D80(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82510D80, id); }
+void RosterProfile_82510DA8(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82510DA8, id); }
+void RosterProfile_82510DE0(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82510DE0, id); }
+void RosterProfile_82510E18(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82510E18, id); }
+void RosterProfile_82510E48(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82510E48, id); }
+void RosterProfile_82510E6C(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82510E6C, id); }
+void RosterProfile_82510E9C(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82510E9C, id); }
+void RosterProfile_82510EB8(PPCRegister& id) { svr07::roster::OnProfileIndexBefore(0x82510EB8, id); }

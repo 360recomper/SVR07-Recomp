@@ -3,6 +3,8 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <utility>
+#include <vector>
 
 #include <rex/ppc/context.h>
 
@@ -12,9 +14,16 @@ namespace svr07::roster {
 // sets, 153-166 blank. Extra superstars get ids from kFirstExtra up.
 constexpr uint32_t kRosterCount = 93;
 constexpr uint32_t kFirstExtra = 167;
-constexpr uint32_t kMaxExtras = 32;
+// Ids 167-632: model numbers id*100 + 0..99 stay 16-bit (<= 63299) and entry names
+// (X + 3 base-36 digits of n - 16700) reach 632. 255 is never used ("none"; 25500 = no model).
+constexpr uint32_t kMaxExtras = 466;
+constexpr uint32_t kNoId = 255;
 
 bool IsExtra(uint32_t id);
+
+// Extras whose mods\roster\<folder> has pictures (body/face/bust .png/.dds): id, folder.
+// Filled by BuildRosterFiles; read by the portrait merge.
+std::vector<std::pair<uint32_t, std::filesystem::path>> ExtraPictureFolders();
 
 // Called after a `cmpwi/cmplwi crN,rM,93` (tools/roster_sites.py generates the call
 // sites). kRoster: an extra id compares like a roster id (less than 93), so the game
@@ -31,6 +40,13 @@ void OnIdCompare(uint32_t addr, Site policy, PPCCRRegister& cr, PPCRegister& id)
 bool IsExtraModel(uint32_t n);
 void OnModelSub(uint32_t addr, PPCRegister& diff);
 void OnModelCompare(uint32_t addr, PPCCRRegister& cr, PPCRegister& n);
+
+// Inline profile reads: `mulli rT,rS,412` where the result is added to the current
+// profile set's block (sub_821B8E98; a profile is block + 88 + id*412). For an extra id
+// the result is made to point at the extra's own profile. Before: rT == rS (the id is
+// overwritten), so the id is changed to a number whose *412 gives that offset.
+void OnProfileIndexBefore(uint32_t addr, PPCRegister& id);
+void OnProfileIndexAfter(uint32_t addr, PPCRegister& product, PPCRegister& id);
 
 // Startup, before the game files are mounted: reads mods\roster, assigns ids
 // (mods\roster\slots.txt), writes the extras' model pac and the plist360.h files

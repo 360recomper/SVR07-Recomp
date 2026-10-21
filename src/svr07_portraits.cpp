@@ -564,7 +564,7 @@ bool AllDigits(const std::string& s) {
   return !s.empty() && s.size() <= 4 && std::all_of(s.begin(), s.end(), ::isdigit);
 }
 
-std::vector<Slot> FindSlots(const fs::path& portraits) {
+std::vector<Slot> FindSlots(const fs::path& portraits, const PictureFolders& extra_folders) {
   std::map<uint32_t, Slot> slots;
   std::error_code ec;
   for (auto& e : fs::directory_iterator(portraits, ec)) {
@@ -575,6 +575,12 @@ std::vector<Slot> FindSlots(const fs::path& portraits) {
     } else if (e.is_regular_file() && AllDigits(stem) && e.path().extension() == ".png") {
       slots[std::stoul(stem)].body_png = e.path();
     }
+  }
+  // Roster extras can keep their pictures in their own mods\roster\<folder> (their id
+  // is only known at startup); mods\portraits\<id> wins when both exist.
+  for (auto& [id, folder] : extra_folders) {
+    auto& s = slots[id];
+    if (s.dir.empty() && s.body_png.empty()) s.dir = folder;
   }
   std::vector<Slot> out;
   for (auto& [id, s] : slots) {
@@ -636,9 +642,10 @@ std::string Stamp(const fs::path& base, const std::vector<Slot>& slots) {
 
 }  // namespace
 
-void BuildPortraitPacs(const fs::path& game_root, const fs::path& mods, const fs::path& out_root) {
+void BuildPortraitPacs(const fs::path& game_root, const fs::path& mods, const fs::path& out_root,
+                       const PictureFolders& extra_folders) {
   std::vector<Slot> slots;
-  if (!mods.empty()) slots = FindSlots(mods / "portraits");
+  if (!mods.empty()) slots = FindSlots(mods / "portraits", extra_folders);
 
   // Pictures are made once and shared by menuHD and menuSD.
   std::map<std::pair<uint32_t, int>, Bytes> pictures;
@@ -839,11 +846,12 @@ void FixPacIndexes(const fs::path& game_root, const fs::path& mods, const fs::pa
   RebuildPacIndex(roots, out_root, "pac/plist360_4x3.h", "plist360_4x3.arc");
 }
 
-void PreparePortraits(const fs::path& game_root, const fs::path& cache_root) {
+void PreparePortraits(const fs::path& game_root, const fs::path& cache_root,
+                      const PictureFolders& extra_folders) {
   const fs::path out_root = cache_root / "mods_generated";
   rex::Runtime::AddModsOverlay(out_root);
   const fs::path mods = rex::Runtime::ResolveModsRoot();
-  BuildPortraitPacs(game_root, mods, out_root);
+  BuildPortraitPacs(game_root, mods, out_root, extra_folders);
   FixPacIndexes(game_root, mods, out_root);
 }
 

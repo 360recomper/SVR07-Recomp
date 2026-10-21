@@ -33,3 +33,12 @@ name = "RosterSelectListLoop"
 registers = ["cr6", "r31", "r28", "r23"]
 after_instruction = true
 
+
+# Match-up / preview screen model setup (sub_8246A958): a roster id's model size comes
+# from a 93-entry float table, 0x82041C88 + 4 + id*8 (`rlwinm r11,r25,3,0,28`, then lfsx).
+# An extra reads its base superstar's entry instead of past the table.
+[[midasm_hook]]
+address = 0x8246AB24
+name = "RosterPreviewSize"
+registers = ["r11", "r25"]
+after_instruction = true

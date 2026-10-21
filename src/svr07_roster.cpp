@@ -61,6 +61,8 @@ constexpr uint32_t kProfileSize = 412;
 constexpr uint32_t kGmSize = 76;
 constexpr uint32_t kProfileSets = 8;  // set index from sub_821B9AF0's r5, or [0x8293464C]
 constexpr uint32_t kCurrentProfileSet = 0x8293464C;
+constexpr uint32_t kProfileBlocks = 0x827A8558;  // set s: + s * kProfileSetSize (sub_821B8E98)
+constexpr uint32_t kProfileSetSize = 0x11E10;
 constexpr uint32_t kSelectListMax = 123;  // the select screen keeps its list in 123 slots
 constexpr uint32_t kEmdFormat = 0x82001E48;  // "/EMD/%04d"
 constexpr uint32_t kFirstExtraModel = kFirstExtra * 100;
@@ -78,11 +80,18 @@ constexpr uint32_t kRecPlayable = 160;  // 1 = on the select screen
 
 // ---- extras ------------------------------------------------------------------
 
+// File sizes of the per-extra overrides (as in misc.pac CHAR/DAT, CHAR/PRO and
+// gm_mode.pac GMMD/DATA: one decompressed child / record, little-endian).
+constexpr uint32_t kDatSize = 176;
+
 struct Extra {
   uint32_t id = 0;
   std::string folder, name, nick, short_name;
+  fs::path dir;
   uint32_t base = 0;  // roster superstar it starts from (stats, moves, entrance)
   int brand = -1, female = -1;
+  Bytes dat, pro, gmd;  // own records (dat=, pro=, gmd=), empty = the base's
+  bool pictures = false;
 };
 
 std::vector<Extra> g_extras;  // filled at startup, read-only afterwards
@@ -90,6 +99,7 @@ std::array<int, kMaxExtras> g_slot_of{};  // id - kFirstExtra -> index in g_extr
 
 std::mutex g_mutex;  // guards the storage setup below
 uint32_t g_records = 0, g_profiles = 0, g_gm = 0;  // guest addresses
+uint8_t* g_base = nullptr;  // guest memory, for the register-only site hooks
 std::array<bool, kMaxExtras> g_ready{};
 
 int SlotOf(uint32_t id) {
@@ -162,7 +172,7 @@ uint32_t Call(PPCContext& ctx, uint8_t* base, GuestFn fn, uint32_t a = 0, uint32
 
 uint32_t RecordAddr(uint32_t slot) { return g_records + slot * kRecordSize; }
 uint32_t ProfileAddr(uint32_t slot, uint32_t set) {
-  return g_profiles + (set * kMaxExtras + slot) * kProfileSize;
+  return g_profiles + (set * uint32_t(g_extras.size()) + slot) * kProfileSize;
 }
 uint32_t GmAddr(uint32_t slot) { return g_gm + slot * kGmSize; }
 
@@ -177,47 +187,76 @@ void EnsureReady(PPCContext& ctx, uint8_t* base, int slot) {
   if (g_ready[slot]) return;
   std::lock_guard lock(g_mutex);
   if (g_ready[slot]) return;
+  g_base = base;
   if (!g_records) {
     auto* mem = REX_KERNEL_MEMORY();
-    g_records = mem->SystemHeapAlloc(kMaxExtras * kRecordSize);
-    g_profiles = mem->SystemHeapAlloc(kProfileSets * kMaxExtras * kProfileSize);
-    g_gm = mem->SystemHeapAlloc(kMaxExtras * kGmSize);
-    std::memset(base + g_records, 0, kMaxExtras * kRecordSize);
-    std::memset(base + g_profiles, 0, kProfileSets * kMaxExtras * kProfileSize);
-    std::memset(base + g_gm, 0, kMaxExtras * kGmSize);
+    const uint32_t n = uint32_t(g_extras.size());  // fixed after startup
+    g_records = mem->SystemHeapAlloc(n * kRecordSize);
+    g_profiles = mem->SystemHeapAlloc(kProfileSets * n * kProfileSize);
+    g_gm = mem->SystemHeapAlloc(n * kGmSize);
+    std::memset(base + g_records, 0, n * kRecordSize);
+    std::memset(base + g_profiles, 0, kProfileSets * n * kProfileSize);
+    std::memset(base + g_gm, 0, n * kGmSize);
     REXLOG_INFO("Roster: extra storage at {:08X} (records) {:08X} (profiles) {:08X} (GM)",
                 g_records, g_profiles, g_gm);
   }
   const Extra& e = g_extras[slot];
-  // Record: the base's, renamed, with its own id and model number.
+  // Record: the base's (or dat=, converted like sub_82122470 does: its u16 fields
+  // swapped), renamed, with its own id and model number.
   uint32_t rec = RecordAddr(slot);
   Copy(base, rec, Call(ctx, base, __imp__sub_821B9A70, e.base, uint32_t(-1)), kRecordSize);
-  PutString(base, rec + kRecName, e.name, 46);
-  PutString(base, rec + kRecNick, e.nick.empty() ? e.short_name : e.nick, 46);
-  PutString(base, rec + kRecShort, e.short_name, 26);
+  if (!e.dat.empty()) {
+    std::memcpy(base + rec, e.dat.data(), kDatSize);
+    for (uint32_t at : {22u, 24u, 26u, 150u, 152u, 154u, 156u}) std::swap(base[rec + at], base[rec + at + 1]);
+  }
+  if (!e.name.empty()) PutString(base, rec + kRecName, e.name, 46);
+  if (!e.nick.empty() || e.dat.empty())
+    PutString(base, rec + kRecNick, e.nick.empty() ? e.short_name : e.nick, 46);
+  if (!e.short_name.empty()) PutString(base, rec + kRecShort, e.short_name, 26);
   REX_STORE_U16(rec + kRecModel, uint16_t(e.id));
   base[rec + kRecId] = uint8_t(e.id);
   for (uint32_t a = 0; a < 4; ++a) REX_STORE_U16(rec + kRecAttires + 2 * a, uint16_t(e.id * 10 + 1 + a));
   base[rec + kRecPlayable] = 1;
   if (e.brand >= 0) base[rec + kRecBrand] = uint8_t(e.brand);
   if (e.female >= 0) base[rec + kRecFemale] = uint8_t(e.female);
-  // Profiles: the base's in every set.
+  // Profiles: the base's (or pro=, converted by the game's sub_821B99D8 like the
+  // CHAR/PRO loader sub_821B9BA0 does) in every set.
   for (uint32_t s = 0; s < kProfileSets; ++s) {
-    uint32_t src = Call(ctx, base, __imp__sub_821B9AF0, e.base, uint32_t(-1), s);
-    Copy(base, ProfileAddr(slot, s), src, kProfileSize);
+    uint32_t dst = ProfileAddr(slot, s);
+    if (!e.pro.empty()) {
+      std::memcpy(base + dst, e.pro.data(), kProfileSize);
+      Call(ctx, base, sub_821B99D8, dst);
+    } else {
+      Copy(base, dst, Call(ctx, base, __imp__sub_821B9AF0, e.base, uint32_t(-1), s), kProfileSize);
+    }
   }
-  // GM-mode record: the base's, own id, not in the draft pool.
+  // GM-mode record: the base's (or gmd=, converted by sub_82354528 like the
+  // gm_mode.pac loader sub_82354710 does), own id, not in the draft pool.
   uint32_t gm = GmAddr(slot);
-  Copy(base, gm, Call(ctx, base, sub_821B8E30) + 29648 + e.base * kGmSize, kGmSize);
+  if (!e.gmd.empty()) {
+    std::memcpy(base + gm, e.gmd.data(), kGmSize);
+    Call(ctx, base, sub_82354528, gm);
+  } else {
+    Copy(base, gm, Call(ctx, base, sub_821B8E30) + 29648 + e.base * kGmSize, kGmSize);
+  }
   base[gm + 0] = uint8_t(e.id);
   base[gm + 1] = 0;
   g_ready[slot] = true;
-  REXLOG_INFO("Roster: {} ready as id {} (base {})", e.name, e.id, e.base);
+  REXLOG_INFO("Roster: {} ready as id {} (base {}{}{}{})", e.name, e.id, e.base,
+              e.dat.empty() ? "" : ", own DAT", e.pro.empty() ? "" : ", own PRO",
+              e.gmd.empty() ? "" : ", own GMD");
 }
 
 }  // namespace
 
 bool IsExtra(uint32_t id) { return SlotOf(id) >= 0; }
+
+std::vector<std::pair<uint32_t, fs::path>> ExtraPictureFolders() {
+  std::vector<std::pair<uint32_t, fs::path>> out;
+  for (auto& e : g_extras)
+    if (e.pictures) out.emplace_back(e.id, e.dir);
+  return out;
+}
 
 void OnIdCompare(uint32_t addr, Site policy, PPCCRRegister& cr, PPCRegister& id) {
   if (REXCVAR_GET(roster_trace_sites)) {
@@ -260,6 +299,41 @@ void OnModelSub(uint32_t addr, PPCRegister& diff) {
   if (!IsExtraModel(n)) return;
   LogModelSite(addr, n);
   diff.u64 = uint64_t(-1);
+}
+
+namespace {
+// id*412 for an extra: the offset from the current set's block to its profile - 88.
+bool ProfileOffset(uint32_t addr, uint32_t id, uint32_t& offset) {
+  int slot = SlotOf(id);
+  if (slot < 0) return false;
+  uint8_t* base = g_base;
+  if (!base || !g_ready[slot]) {
+    REXLOG_WARN("Roster: profile site {:08X}: extra id {} not set up yet", addr, id);
+    return false;
+  }
+  uint32_t set = ProfileSet(base, -1);
+  offset = ProfileAddr(slot, set) - 88 - (kProfileBlocks + set * kProfileSetSize);
+  static std::mutex m;
+  static std::set<uint32_t> seen;
+  std::lock_guard lock(m);
+  if (seen.insert(addr).second)
+    REXLOG_INFO("Roster: profile site {:08X} saw extra id {} (own profile)", addr, id);
+  return true;
+}
+}  // namespace
+
+void OnProfileIndexBefore(uint32_t addr, PPCRegister& id) {
+  uint32_t offset;
+  if (!ProfileOffset(addr, id.u32, offset)) return;
+  // v * 412 == offset (mod 2^32): 412 = 4 * 103, offset is a multiple of 4, 103 is odd.
+  uint32_t inv = 103;
+  for (int i = 0; i < 5; ++i) inv *= 2 - 103 * inv;
+  id.u64 = uint32_t((offset >> 2) * inv);
+}
+
+void OnProfileIndexAfter(uint32_t addr, PPCRegister& product, PPCRegister& id) {
+  uint32_t offset;
+  if (ProfileOffset(addr, id.u32, offset)) product.u64 = offset;
 }
 
 void OnModelCompare(uint32_t addr, PPCCRRegister& cr, PPCRegister& n) {
@@ -388,8 +462,6 @@ void BuildRosterFiles(const fs::path& game_root, const fs::path& mods, const fs:
   }
 
   auto slots = ReadSlots(dir / "slots.txt");
-  std::set<uint32_t> used;
-  for (auto& [f, id] : slots) used.insert(id);
   std::vector<PacEntry> models;
   Bytes unused_header, unused_footer;
   std::vector<fs::path> folders;
@@ -397,42 +469,155 @@ void BuildRosterFiles(const fs::path& game_root, const fs::path& mods, const fs:
     if (it.is_directory() && !fs::exists(it.path() / "disabled", ec)) folders.push_back(it.path());
   std::sort(folders.begin(), folders.end());
 
+  // A file named by a manifest key, inside the folder, of exactly `size` bytes.
+  auto key_file = [](const fs::path& folder, std::map<std::string, std::string>& kv,
+                     const char* key, size_t size) {
+    if (!kv.count(key) || kv[key].empty()) return Bytes();
+    fs::path p = folder / kv[key];
+    std::error_code ec2;
+    if (!fs::is_regular_file(p, ec2)) throw std::runtime_error(std::string(key) + "= file not found");
+    Bytes b = ReadFile(p);
+    if (b.size() != size)
+      throw std::runtime_error(fmt::format("{}= file is {} bytes, must be {}", key, b.size(), size));
+    return b;
+  };
+  auto field = [](const Bytes& dat, size_t at, size_t len) {
+    const char* p = reinterpret_cast<const char*>(dat.data() + at);
+    return std::string(p, strnlen(p, len));
+  };
+
+  // Pass 1: manifests.
+  struct Pending {
+    Extra e;
+    uint32_t pinned = 0;  // id= (0 = none)
+  };
+  std::vector<Pending> pending;
   for (auto& folder : folders) {
     std::string key = folder.filename().string();
     try {
       auto kv = ReadManifest(folder / "manifest.txt");
-      Extra e;
+      Pending p;
+      Extra& e = p.e;
       e.folder = key;
+      e.dir = folder;
+      e.dat = key_file(folder, kv, "dat", kDatSize);
+      e.pro = key_file(folder, kv, "pro", kProfileSize);
+      e.gmd = key_file(folder, kv, "gmd", kGmSize);
       e.name = kv["name"];
-      e.short_name = kv.count("short") ? kv["short"] : e.name;
+      if (e.name.empty() && !e.dat.empty()) e.name = field(e.dat, kRecName, 46);
+      e.short_name = kv.count("short") ? kv["short"]
+                     : !e.dat.empty()   ? field(e.dat, kRecShort, 26)
+                                        : e.name;
       e.nick = kv["nick"];
       e.base = uint32_t(std::stoul(kv.count("base") ? kv["base"] : "0"));
       if (kv.count("brand")) e.brand = std::stoi(kv["brand"]);
       if (kv.count("female")) e.female = std::stoi(kv["female"]);
-      if (e.name.empty()) throw std::runtime_error("manifest.txt has no name=");
+      if (kv.count("id")) p.pinned = uint32_t(std::stoul(kv["id"]));
+      if (e.name.empty()) throw std::runtime_error("manifest.txt has no name= (and no dat=)");
       if (e.base >= kRosterCount) throw std::runtime_error("base= must be a roster id (0-92)");
-      if (!slots.count(key)) {
-        uint32_t id = kFirstExtra;
-        while (used.count(id)) ++id;
-        slots[key] = id;
-        used.insert(id);
-      }
-      e.id = slots[key];
-      if (e.id < kFirstExtra || e.id >= kFirstExtra + kMaxExtras)
-        throw std::runtime_error("no free id left (ids 167-198)");
-      // Model: the folder's ch.pac (any superstar's), its entries renumbered to this id.
-      auto entries = ReadModelPac(folder / "ch.pac", unused_header, unused_footer);
-      for (auto& m : entries) {
-        uint32_t n = uint32_t(std::stoul(m.name));
-        m.name = ExtraEntryName(e.id * 100 + n % 100);
-        models.push_back(std::move(m));
+      if (p.pinned && (p.pinned < kFirstExtra || p.pinned >= kFirstExtra + kMaxExtras ||
+                       p.pinned == kNoId))
+        throw std::runtime_error(fmt::format("id= must be {}-{}, not {}", kFirstExtra,
+                                             kFirstExtra + kMaxExtras - 1, kNoId));
+      for (const char* pic : {"body", "face", "bust"})
+        for (const char* ext : {".png", ".dds"})
+          if (fs::is_regular_file(folder / (std::string(pic) + ext), ec)) e.pictures = true;
+      pending.push_back(std::move(p));
+    } catch (const std::exception& ex) {
+      REXLOG_WARN("Roster: skipping mods\\roster\\{}: {}", key, ex.what());
+    }
+  }
+
+  // Pass 2: ids. id= first, then the folder's id from slots.txt (unless an id= took it),
+  // then the first free one. slots.txt keeps them.
+  std::map<uint32_t, std::string> owner;
+  for (auto& p : pending) {
+    if (!p.pinned) continue;
+    if (owner.count(p.pinned)) {
+      REXLOG_WARN("Roster: mods\\roster\\{}: id={} is also {}'s, left out", p.e.folder, p.pinned,
+                  owner[p.pinned]);
+      p.e.id = 0;
+      p.pinned = uint32_t(-1);
+      continue;
+    }
+    owner[p.pinned] = p.e.folder;
+    p.e.id = p.pinned;
+  }
+  for (auto& p : pending) {
+    if (p.pinned || !slots.count(p.e.folder)) continue;
+    uint32_t id = slots[p.e.folder];
+    if (id >= kFirstExtra && id < kFirstExtra + kMaxExtras && id != kNoId && !owner.count(id)) {
+      owner[id] = p.e.folder;
+      p.e.id = id;
+    }
+  }
+  for (auto& p : pending) {
+    if (p.e.id || p.pinned) continue;
+    uint32_t id = kFirstExtra;
+    // Keep ids slots.txt gives folders that aren't here right now.
+    auto taken = [&](uint32_t i) {
+      if (owner.count(i)) return true;
+      for (auto& [f, sid] : slots)
+        if (sid == i && f != p.e.folder) return true;
+      return false;
+    };
+    while (id < kFirstExtra + kMaxExtras && (id == kNoId || taken(id))) ++id;
+    if (id >= kFirstExtra + kMaxExtras) {
+      REXLOG_WARN("Roster: skipping mods\\roster\\{}: no free id left (ids {}-{})", p.e.folder,
+                  kFirstExtra, kFirstExtra + kMaxExtras - 1);
+      continue;
+    }
+    owner[id] = p.e.folder;
+    p.e.id = id;
+  }
+
+  // Pass 3: models. The merged ch92.pac is big (the WK pack alone is ~140 MB), so it is
+  // only rebuilt when an input changed: a stamp lists the host pac and every extra's
+  // id and ch.pac (size, time) as of the last build.
+  const fs::path host = !mods.empty() && fs::exists(mods / host_rel, ec) ? mods / host_rel
+                                                                         : game_root / host_rel;
+  auto file_key = [&](const fs::path& f) {
+    std::error_code ec2;
+    return fmt::format("{}|{}|{}", f.string(), fs::file_size(f, ec2),
+                       fs::last_write_time(f, ec2).time_since_epoch().count());
+  };
+  std::string stamp = "svr07-roster 1\n" + file_key(host) + "\n";
+  for (auto& p : pending)
+    if (p.e.id) stamp += fmt::format("{}|{}\n", p.e.id, file_key(p.e.dir / "ch.pac"));
+  fs::path stamp_file = pac_out;
+  stamp_file += ".stamp";
+  bool cached = false;
+  if (fs::exists(pac_out, ec) && fs::exists(stamp_file, ec)) {
+    Bytes old = ReadFile(stamp_file);
+    cached = std::string(old.begin(), old.end()) == stamp;
+  }
+
+  size_t extras_with_models = 0;
+  for (auto& p : pending) {
+    Extra& e = p.e;
+    if (!e.id) continue;
+    slots[e.folder] = e.id;
+    try {
+      size_t count = 0;
+      if (!cached) {
+        // Model: the folder's ch.pac (any superstar's), its entries renumbered to this id.
+        auto entries = ReadModelPac(e.dir / "ch.pac", unused_header, unused_footer);
+        count = entries.size();
+        for (auto& m : entries) {
+          uint32_t n = uint32_t(std::stoul(m.name));
+          m.name = ExtraEntryName(e.id * 100 + n % 100);
+          models.push_back(std::move(m));
+        }
       }
       g_slot_of[e.id - kFirstExtra] = int(g_extras.size());
       g_extras.push_back(e);
-      REXLOG_INFO("Roster: {} = id {} (base {}, {} model entries)", e.name, e.id, e.base,
-                  entries.size());
+      ++extras_with_models;
+      REXLOG_INFO("Roster: {} = id {} (base {}, {}{}{}{}{})", e.name, e.id, e.base,
+                  cached ? std::string("model cached") : fmt::format("{} model entries", count),
+                  e.dat.empty() ? "" : ", dat", e.pro.empty() ? "" : ", pro",
+                  e.gmd.empty() ? "" : ", gmd", e.pictures ? ", pictures" : "");
     } catch (const std::exception& ex) {
-      REXLOG_WARN("Roster: skipping mods\\roster\\{}: {}", key, ex.what());
+      REXLOG_WARN("Roster: skipping mods\\roster\\{}: {}", e.folder, ex.what());
     }
   }
 
@@ -440,18 +625,26 @@ void BuildRosterFiles(const fs::path& game_root, const fs::path& mods, const fs:
   for (auto& [f, id] : slots) text += f + "\t" + std::to_string(id) + "\r\n";
   WriteFileIfChanged(dir / "slots.txt", Bytes(text.begin(), text.end()));
 
+  if (cached) {
+    REXLOG_INFO("Roster: {} is up to date ({} extras)", host_rel.string(), extras_with_models);
+    return;
+  }
+  fs::remove(stamp_file, ec);
   if (models.empty()) {
     fs::remove(pac_out, ec);
     return;
   }
   try {
-    fs::path host = !mods.empty() && fs::exists(mods / host_rel, ec) ? mods / host_rel
-                                                                     : game_root / host_rel;
     Bytes header, footer;
     auto merged = ReadModelPac(host, header, footer);
     merged.insert(merged.end(), std::make_move_iterator(models.begin()),
                   std::make_move_iterator(models.end()));
     WriteFileIfChanged(pac_out, WriteModelPac(merged, header, footer));
+    // Only extras whose ch.pac made it in are in g_extras; a failed one changes the
+    // stamp, so the next start tries again.
+    std::string done = "svr07-roster 1\n" + file_key(host) + "\n";
+    for (auto& e : g_extras) done += fmt::format("{}|{}\n", e.id, file_key(e.dir / "ch.pac"));
+    WriteFileIfChanged(stamp_file, Bytes(done.begin(), done.end()));
   } catch (const std::exception& ex) {
     REXLOG_ERROR("Roster: couldn't write the extras' models into {}: {}", host_rel.string(),
                  ex.what());
@@ -489,6 +682,13 @@ constexpr uint32_t kGameBlock = 2460;
 std::mutex g_list_mutex;
 std::unordered_map<uint32_t, uint32_t> g_lists;  // caller's block -> ours
 }  // namespace
+
+// Preview model size (config/roster_manual.toml): off = id*8 into a 93-entry table.
+void RosterPreviewSize(PPCRegister& off, PPCRegister& id) {
+  int slot = R::SlotOf(id.u32);
+  if (slot < 0) return;
+  off.u64 = R::g_extras[slot].base * 8;
+}
 
 void RosterSelectListLoop(PPCCRRegister& cr, PPCRegister& i, PPCRegister& limit,
                           PPCRegister& count) {
@@ -633,6 +833,104 @@ REX_HOOK_RAW(sub_8255F9F0) {
   __imp__sub_8255F9F0(ctx, base);
 }
 
+// Model exists?: sub_820D4858(?, n, set) -> nonzero when "/EMD/%04d" n is there. Numbers
+// of 10000 and up get a CAW-part test, then `n / 100 >= 100` returns 0 before the lookup,
+// so an extra's (its own n - 10000 test is hooked) was always missing. Its callers then
+// draw someone else: the match-intro / preview pair (sub_82538BB8) id 55, sub_82709A50
+// model 3902 (Cena). For extras, look the entry up like the game does for roster numbers.
+REX_HOOK_RAW(sub_820D4858) {
+  const uint32_t n = ctx.r4.u32 & 0xFFFF;
+  if (!R::IsExtraModel(n)) return __imp__sub_820D4858(ctx, base);
+  PPCContext saved = ctx;
+  ctx.r1.u64 = ctx.r1.u32 - 112;
+  const uint32_t buf = ctx.r1.u32 + 80;
+  const std::string s = "/EMD/" + R::ExtraEntryName(n);
+  std::memcpy(base + buf, s.c_str(), s.size() + 1);
+  ctx.r3.u64 = buf;
+  ctx.r4.u64 = 0;
+  sub_8241C660(ctx, base);
+  const uint32_t found = ctx.r3.u32;
+  ctx = saved;
+  ctx.r3.u64 = found;
+  if (REXCVAR_GET(roster_trace_sites))
+    REXLOG_INFO("Roster trace: model {} exists? {} -> {}", n, s, found);
+}
+
+// Free physical memory (the 0-512 MB pool textures, movies and audio buffers come from),
+// logged at the points that load big things, to see what runs it dry.
+namespace {
+void LogPhysicalFree(const std::string& what) {
+  auto* heap = REX_KERNEL_MEMORY()->GetPhysicalHeap();
+  if (!heap) return;
+  const uint64_t page = heap->page_size();
+  REXLOG_INFO("Roster mem: {}: physical free {} MB of {} MB", what,
+              heap->GetUnreservedPageCount() * page >> 20, heap->GetTotalPageCount() * page >> 20);
+}
+}  // namespace
+
+// ---- titantron movies -----------------------------------------------------------
+//
+// sub_821CB198(movie id) -> path in a static buffer: looks the id up in a 100-entry
+// {id, "NN.bik"} table, formats "%s%s%s" (GAME:\, MOVIES\titantron\, name) and checks
+// the file (sub_82421850), else formats "%s%sdummy.bik". An id the table doesn't list
+// (the name pointer stays 0) or one whose file is missing gets <id as %02d>.bik when
+// that file is there (mods overlay or game), so ported entrances can use new movie ids.
+
+namespace {
+constexpr uint32_t kTitantronTable = 0x82015768;  // 100 x {u32 id, u32 name}
+constexpr uint32_t kTitantronCount = 100;
+constexpr uint32_t kTitantronPathFmt = 0x82015A98;   // "%s%s%s"
+constexpr uint32_t kTitantronDummyFmt = 0x82015A88;  // "%s%sdummy.bik"
+constexpr uint32_t kTitantronRoot = 0x82015AA0;      // r5
+constexpr uint32_t kTitantronDir = 0x82015AA8;       // r6
+constexpr uint32_t kTitantronPath = 0x829414F0;      // the result buffer
+}  // namespace
+
+REX_HOOK_RAW(sub_821CB198) {
+  const int32_t id = ctx.r3.s32;
+  LogPhysicalFree(fmt::format("titantron {}", id));
+  bool listed = false;
+  for (uint32_t i = 0; i < kTitantronCount; ++i)
+    if (int32_t(REX_LOAD_U32(kTitantronTable + 8 * i)) == id) listed = true;
+  if (listed) {
+    __imp__sub_821CB198(ctx, base);
+    const char* got = reinterpret_cast<const char*>(base + ctx.r3.u32);
+    if (!std::strstr(got, "dummy.bik")) return;
+  }
+  if (id < 0) {
+    if (!listed) __imp__sub_821CB198(ctx, base);
+    return;
+  }
+  // Same formatting and file test as the game, with the name "<id>.bik" in guest stack.
+  PPCContext saved = ctx;
+  ctx.r1.u64 = ctx.r1.u32 - 128;
+  const uint32_t name = ctx.r1.u32 + 80;
+  const std::string n = fmt::format("{:02d}.bik", id);
+  std::memcpy(base + name, n.c_str(), n.size() + 1);
+  ctx.r3.u64 = kTitantronPath;
+  ctx.r4.u64 = kTitantronPathFmt;
+  ctx.r5.u64 = kTitantronRoot;
+  ctx.r6.u64 = kTitantronDir;
+  ctx.r7.u64 = name;
+  sub_8255F9F0(ctx, base);
+  const uint32_t exists = R::Call(ctx, base, sub_82421850, kTitantronPath, 0, 0);
+  ctx = saved;
+  if (exists) {
+    static std::mutex m;
+    static std::set<int32_t> seen;
+    std::lock_guard lock(m);
+    if (seen.insert(id).second)
+      REXLOG_INFO("Roster: titantron {} -> {}", id,
+                  reinterpret_cast<const char*>(base + kTitantronPath));
+    ctx.r3.u64 = kTitantronPath;
+    return;
+  }
+  // Not there either: the game's own fallback, "%s%sdummy.bik".
+  R::Call(ctx, base, sub_8255F9F0, kTitantronPath, kTitantronDummyFmt, kTitantronRoot,
+          kTitantronDir);
+  ctx.r3.u64 = kTitantronPath;
+}
+
 // ---- select pictures ----------------------------------------------------------
 //
 // A picture bank (menuHD/SD MENU/SF2A face, SF2B body, SF2D bust) holds a 108-entry
@@ -641,10 +939,35 @@ REX_HOOK_RAW(sub_8255F9F0) {
 // texture handle (entry+32, 8 bytes), or the silhouette (bank+412) when missing. Extras'
 // pictures are PACH children with their id (mods\portraits\<id>, merged at startup);
 // their texture objects are kept here per bank.
+//
+// The game frees the textures in a bank's own table with the bank, but not ours: making
+// new ones at every build leaked ~10 MB of physical memory per select-screen visit (166
+// extras) until a match load ran out (Bink/loader null allocs). So each picture's texture
+// object is made once (own system-heap object, keyed by id + the DDS bytes + the bank's
+// texture flags) and reused by every later build.
 
 namespace {
 std::mutex g_pic_mutex;
 std::unordered_map<uint32_t, std::array<uint32_t, R::kMaxExtras>> g_pictures;  // bank -> objects
+struct PictureKey {
+  uint32_t id, size, flags;
+  uint64_t hash;
+  bool operator==(const PictureKey& o) const {
+    return id == o.id && size == o.size && flags == o.flags && hash == o.hash;
+  }
+};
+struct PictureKeyHash {
+  size_t operator()(const PictureKey& k) const {
+    return size_t(k.hash ^ (uint64_t(k.id) << 32) ^ k.size ^ (uint64_t(k.flags) << 16));
+  }
+};
+std::unordered_map<PictureKey, uint32_t, PictureKeyHash> g_picture_objects;  // -> object
+
+uint64_t Fnv1a(const uint8_t* p, uint32_t n) {
+  uint64_t h = 1469598103934665603ull;
+  for (uint32_t i = 0; i < n; ++i) h = (h ^ p[i]) * 1099511628211ull;
+  return h;
+}
 }  // namespace
 
 // sub_82466220 ends with sub_82465CE8(bank) (the CAW picture cache), then frees the
@@ -654,7 +977,10 @@ REX_HOOK_RAW(sub_82465CE8) {
   const uint32_t bank = ctx.r3.u32;
   std::array<uint32_t, R::kMaxExtras> objs{};
   const uint32_t pach = REX_LOAD_U32(bank + 444);
-  int made = 0;
+  int made = 0, reused = 0;
+  uint32_t bytes = 0;
+  const uint32_t flags = REX_LOAD_U16(bank + 468);
+  LogPhysicalFree(fmt::format("picture bank {:08X} before extras", bank));
   if (REXCVAR_GET(roster_trace_sites))
     REXLOG_INFO("Roster trace: picture bank {:08X} built, PACH {:08X}", bank, pach);
   for (auto& e : R::g_extras) {
@@ -668,28 +994,48 @@ REX_HOOK_RAW(sub_82465CE8) {
     uint32_t data = R::Call(ctx, base, sub_8241B700, pach, idx);
     uint32_t size = R::Call(ctx, base, sub_8241B7C8, pach, idx);
     if (!data) continue;
-    uint32_t obj = R::Call(ctx, base, sub_82414CE0)
-                       ? R::Call(ctx, base, sub_82414850, 40, 1)
-                       : R::Call(ctx, base, sub_82415658, 3, 1);
+    const PictureKey key{e.id, size, flags, Fnv1a(base + data, size)};
+    uint32_t obj = 0;
+    {
+      std::lock_guard lock(g_pic_mutex);
+      auto it = g_picture_objects.find(key);
+      if (it != g_picture_objects.end()) obj = it->second;
+    }
+    if (obj) {
+      objs[e.id - R::kFirstExtra] = obj;
+      ++reused;
+      continue;
+    }
+    obj = REX_KERNEL_MEMORY()->SystemHeapAlloc(40, 16);
     if (REXCVAR_GET(roster_trace_sites))
       REXLOG_INFO("Roster trace: bank {:08X} id {}: child {} data {:08X} size {} obj {:08X}", bank,
                   e.id, idx, data, size, obj);
     if (!obj) continue;
+    std::memset(base + obj, 0, 40);
     PPCContext saved = ctx;
     ctx.r3.u64 = obj;
     ctx.r4.u64 = data;
     ctx.r5.u64 = size;
-    ctx.r6.u64 = REX_LOAD_U16(bank + 468);
+    ctx.r6.u64 = flags;
     sub_82708BF0(ctx, base);
     ctx = saved;
+    {
+      std::lock_guard lock(g_pic_mutex);
+      g_picture_objects[key] = obj;
+    }
     objs[e.id - R::kFirstExtra] = obj;
     ++made;
+    bytes += size;
   }
   {
     std::lock_guard lock(g_pic_mutex);
     g_pictures[bank] = objs;
   }
-  if (made) REXLOG_INFO("Roster: picture bank {:08X}: {} extra pictures", bank, made);
+  if (made || reused) {
+    REXLOG_INFO("Roster: picture bank {:08X}: {} extra pictures made ({} KB of DDS), {} reused",
+                bank, made, bytes >> 10, reused);
+    LogPhysicalFree(fmt::format("picture bank {:08X} after extras", bank));
+  }
   ctx.r3.u64 = bank;
   __imp__sub_82465CE8(ctx, base);
 }

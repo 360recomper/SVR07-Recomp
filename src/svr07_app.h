@@ -76,7 +76,8 @@ class Svr07App : public rex::ReXApp {
     // rebuild below reads.
     svr07::roster::BuildRosterFiles(defaults.game_data_root, rex::Runtime::ResolveModsRoot(),
                                     defaults.cache_root / "mods_generated");
-    svr07::PreparePortraits(defaults.game_data_root, defaults.cache_root);
+    svr07::PreparePortraits(defaults.game_data_root, defaults.cache_root,
+                            svr07::roster::ExtraPictureFolders());
     return defaults;
   }
 

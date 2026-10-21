@@ -26,7 +26,8 @@ fixed arrays of 93 that sit right in front of the CAWs' (records at 0x828139BC, 
 0x82817A68), and the save (`CreateData.txt`) is a raw dump of that memory. Growing the roster
 in place would mean moving the CAWs everywhere, save format included.
 
-Instead, extras take **ids 167 and up** (32 for now: 167-198) and get their own storage.
+Instead, extras take **ids 167-632** (466; 255 is skipped: it means none; model numbers id*100+n stay 16-bit and entry names reach 632) and get
+their own storage.
 
 ## How it works
 
@@ -39,6 +40,9 @@ Instead, extras take **ids 167 and up** (32 for now: 167-198) and get their own 
 | Model numbers | `(model*10 + attire)*10 + kind`; **10000 and up = a CAW** (built from edit parts): 89 `n - 10000` sign tests, 7 `cmp n,10000` in the model loaders | generated hooks: an extra's number (its id * 100 + ...) takes the below-10000 branch |
 | Model entry names | `sprintf("/EMD/%04d", n)`, 4-character EPAC names | `sprintf` hook: extras' numbers get `X` + 3 base-36 digits |
 | Model files | entries are found by name through `plist360.arc` | extras' entries are added to a copy of `pac\ch\ch92.pac` laid over the game's (see below) |
+| Model exists? | `sub_820D4858(?, n, set)`: for n >= 10000 a CAW-part test, then `n/100 >= 100` returns 0 before any lookup (used by `sub_82538BB8` for the referee / ring announcer, `sub_82709A50`) | hook: for an extra's number, looks `/EMD/Xnnn` up like the game does for roster numbers |
+| Inline profile reads | 44 `mulli rT,id,412` added to the current set's block (`sub_821B8E98`) in 7 functions: the match-up screen's pose motion (profile +292), create/move screens | generated hooks (`RosterProfile_*`): an extra's index points at its own profile |
+| Match-up / preview model size | `sub_8246A958`: roster ids read a float from a 93-entry table `0x82041C88 + 4 + id*8` (CAWs: record +22) | manual hook at 0x8246AB24: an extra reads its base's entry. Before this, extras were invisible on the "Tonight SmackDown" screen |
 | Select list | `sub_822F8C08` fills 20-byte entries in a 123-entry block of its caller and passes it to the grid (`sub_82301EF0`, list at +72, count at +76) | hook builds it in a bigger block of ours (171 entries), copies the first 123 back, gives the grid ours; the five brand/mode loops get a hook at their end compare that carries them on through the extra ids |
 | Select pictures | banks `MENU/SF2A/B/D`: `sub_82466220` builds a 108-entry table, `sub_82465DC8` looks one up | hook on its last step (`sub_82465CE8`) makes texture objects for the extras' PACH children (id = extra id, from `mods\portraits\<id>`) and answers lookups; silhouette when missing |
 | Other select lists | `sub_82536E20` (other screens) | extras appended while there is room in the caller's 123 |
@@ -89,11 +93,31 @@ Regenerate after a codegen change: `python -I tools/roster_sites.py`, then rebui
 
 | file | |
 |---|---|
-| `manifest.txt` | `name=` (45 chars), `short=` (25), `nick=` (optional), `base=<roster id>` (stats, moves, entrance, class), `brand=0/1/2` (optional), `female=0/1` (optional) |
+| `manifest.txt` | keys below |
 | `ch.pac` | a SvR07 model pac (any superstar's `pac\ch\chNN.pac`); its `EMD` entries are renumbered to the extra's id |
+| `body.png` / `face.png` / `bust.png` (or `.dds`) | (optional) select-screen pictures, same rules as `mods\portraits\<id>\` (which wins if both exist) |
 | `disabled` | (optional) leaves it out |
 
-Pictures: `mods\portraits\<id>\body.png` (the existing portrait merge), id from `slots.txt`.
+`manifest.txt` keys (`key=value`, `#` comments):
+
+| key | |
+|---|---|
+| `name=` | full name (45 chars). Required unless `dat=` is given (then the DAT's name) |
+| `short=` | HUD / short name (25). Default: the DAT's, else `name` |
+| `nick=` | (optional) the nickname field. Default: the DAT's, else `short` |
+| `base=<roster id 0-92>` | superstar it starts from: everything `dat=` / `pro=` / `gmd=` don't give (record, moves, GM record, entrance, class). Default 0 |
+| `id=<167-632>` | (optional) fixed id (not 255); wins over `slots.txt`. Two folders with the same `id=`: the second is left out |
+| `brand=0/1/2` | (optional) RAW / SmackDown / other; overrides the DAT's |
+| `female=0/1` | (optional) overrides the DAT's |
+| `dat=<file>` | (optional) own `CHAR/DAT` record: **176 bytes**, one decompressed `misc.pac` `CHAR/DAT` child as in the file (little-endian; what `slot51_burke.children()` returns). Converted like the game's loader `sub_82122470` (u16s at +22, +24, +26, +150..156 swapped). The port then sets name/short/nick (if given), id (+148), model (+26 = id), attires (+150..157 = id*10+1..4) and playable (+160 = 1) |
+| `pro=<file>` | (optional) own moves profile: **412 bytes** (206 u16 LE), one decompressed `CHAR/PRO` child as in the file. Converted by the game's own `sub_821B99D8` (as `sub_821B9BA0` does); used in every profile set |
+| `gmd=<file>` | (optional) own GM-mode record: **76 bytes**, one record of `gm_mode.pac` `GMMD/DATA` child 0 as in the file (record n at 8 + n*76). Converted by the game's `sub_82354528` (as `sub_82354710` does); the port sets +0 = id and +1 = 0 (kept out of the GM draft) |
+
+File names are relative to the folder. A file of the wrong size skips the whole extra (logged).
+Child data must be decompressed (no `BPE ` header).
+
+Pictures can also go in `mods\portraits\<id>\body.png` (the existing portrait merge), id from
+`slots.txt` / `id=`.
 
 `mods\roster\slots.txt` keeps each folder's id (`<folder>\t<id>`), so adding or removing one
 never moves another's.
