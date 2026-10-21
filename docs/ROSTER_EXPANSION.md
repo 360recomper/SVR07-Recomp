@@ -107,6 +107,7 @@ Regenerate after a codegen change: `python -I tools/roster_sites.py`, then rebui
 | `nick=` | (optional) the nickname field. Default: the DAT's, else `short` |
 | `base=<roster id 0-92>` | superstar it starts from: everything `dat=` / `pro=` / `gmd=` don't give (record, moves, GM record, entrance, class). Default 0 |
 | `id=<167-632>` | (optional) fixed id (not 255); wins over `slots.txt`. Two folders with the same `id=`: the second is left out |
+| `group=<section>` | (optional) select-screen section, e.g. `WWE`, `Wrestle Kingdom`, `Legends`, `Divas`, `Managers / GMs` (see select order below); wins over `select_order.txt` |
 | `brand=0/1/2` | (optional) RAW / SmackDown / other; overrides the DAT's |
 | `female=0/1` | (optional) overrides the DAT's |
 | `dat=<file>` | (optional) own `CHAR/DAT` record: **176 bytes**, one decompressed `misc.pac` `CHAR/DAT` child as in the file (little-endian; what `slot51_burke.children()` returns). Converted like the game's loader `sub_82122470` (u16s at +22, +24, +26, +150..156 swapped). The port then sets name/short/nick (if given), id (+148), model (+26 = id), attires (+150..157 = id*10+1..4) and playable (+160 = 1) |
@@ -115,6 +116,30 @@ Regenerate after a codegen change: `python -I tools/roster_sites.py`, then rebui
 
 File names are relative to the folder. A file of the wrong size skips the whole extra (logged).
 Child data must be decompressed (no `BPE ` header).
+
+### Select-screen order (2026-10-20)
+
+`modsoster\select_order.txt` turns on sections: the engine re-sorts the select list after the game's
+own sort (record +173, one byte, retail only) by (section, name A-Z). CAWs and templates stay last in the
+game's order. Retail ids and extras mix freely inside a section.
+
+```
+order = WWE | Wrestle Kingdom | Legends | Divas | Managers / GMs   # section order
+6 = WWE                       # roster id (0-92) -> section
+wk_lesnar = Wrestle Kingdom   # modsoster\<folder> -> section (a manifest's group= wins)
+```
+
+Not listed anywhere: from the record: brand (+16) 2 = Legends, female (+146) = Divas, not normally
+playable (+160 != 1) = Managers / GMs, else WWE. Sections not named in `order` come after the named ones
+(by name), before the CAWs. No file = the game's order (as before). Generator for the ultimate pack:
+`model-port\select_order.txt` from MASTER-ROSTER.tsv.
+
+Retail 07 by that rule (its own +173 order already groups it this way: men 1-45, divas 46-52, legends
+53-68, staff 69-81): Legends = Rock, Austin, Shane McMahon (13), Lawler (15), Tazz (16), Dusty Rhodes,
+Eddie Guerrero, Roddy Piper, Bam Bam Bigelow, Mankind, Mr. Perfect, Bret Hart, Hulk Hogan, Jim Neidhart,
+Cactus Jack, Dude Love; Divas = Lita, Jillian Hall, Trish Stratus, Candice Michelle, Torrie Wilson, Mickie
+James, Melina; Managers / GMs (play 2, only on screens that list them) = Vince, Stephanie, Chioda, Patrick,
+Cole, Shane (52), Lawler (53), Coachman, Tazz (55), JR, Teddy Long, Chimmel, Lilian; everyone else WWE.
 
 Pictures can also go in `mods\portraits\<id>\body.png` (the existing portrait merge), id from
 `slots.txt` / `id=`.

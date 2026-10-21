@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -92,9 +93,17 @@ struct Extra {
   int brand = -1, female = -1;
   Bytes dat, pro, gmd;  // own records (dat=, pro=, gmd=), empty = the base's
   bool pictures = false;
+  std::string group;  // select-screen section (group=), empty = from the record
 };
 
 std::vector<Extra> g_extras;  // filled at startup, read-only afterwards
+
+// Select-screen sections: mods\roster\select_order.txt ("order = A | B | ...", "<id> = <group>"
+// for roster ids, "<folder> = <group>" for extras) and the manifests' group=. Read at startup.
+bool g_sections = false;
+std::vector<std::string> g_group_order;
+std::map<uint32_t, std::string> g_id_group;
+std::map<std::string, std::string> g_folder_group;
 std::array<int, kMaxExtras> g_slot_of{};  // id - kFirstExtra -> index in g_extras, or -1
 
 std::mutex g_mutex;  // guards the storage setup below
@@ -426,6 +435,30 @@ std::map<std::string, std::string> ReadManifest(const fs::path& p) {
   return kv;
 }
 
+void ReadSelectOrder(const fs::path& p) {
+  std::error_code ec;
+  if (!fs::is_regular_file(p, ec)) return;
+  g_sections = true;
+  for (auto& [key, value] : ReadManifest(p)) {
+    if (key == "order") {
+      std::string rest = value;
+      for (size_t at; !rest.empty();) {
+        at = rest.find('|');
+        std::string g = Trim(rest.substr(0, at));
+        if (!g.empty()) g_group_order.push_back(g);
+        if (at == std::string::npos) break;
+        rest = rest.substr(at + 1);
+      }
+    } else if (!key.empty() && std::all_of(key.begin(), key.end(), ::isdigit)) {
+      g_id_group[uint32_t(std::stoul(key))] = value;
+    } else {
+      g_folder_group[key] = value;
+    }
+  }
+  REXLOG_INFO("Roster: select sections from {}: {} groups, {} ids, {} folders", p.string(),
+              g_group_order.size(), g_id_group.size(), g_folder_group.size());
+}
+
 // mods\roster\slots.txt: "<folder>\t<id>" per line. A mod keeps its id, so adding or
 // removing one never moves another's data.
 std::map<std::string, uint32_t> ReadSlots(const fs::path& p) {
@@ -462,6 +495,7 @@ void BuildRosterFiles(const fs::path& game_root, const fs::path& mods, const fs:
   }
 
   auto slots = ReadSlots(dir / "slots.txt");
+  ReadSelectOrder(dir / "select_order.txt");
   std::vector<PacEntry> models;
   Bytes unused_header, unused_footer;
   std::vector<fs::path> folders;
@@ -513,6 +547,8 @@ void BuildRosterFiles(const fs::path& game_root, const fs::path& mods, const fs:
       if (kv.count("brand")) e.brand = std::stoi(kv["brand"]);
       if (kv.count("female")) e.female = std::stoi(kv["female"]);
       if (kv.count("id")) p.pinned = uint32_t(std::stoul(kv["id"]));
+      e.group = kv["group"];
+      if (e.group.empty() && g_folder_group.count(key)) e.group = g_folder_group[key];
       if (e.name.empty()) throw std::runtime_error("manifest.txt has no name= (and no dat=)");
       if (e.base >= kRosterCount) throw std::runtime_error("base= must be a roster id (0-92)");
       if (p.pinned && (p.pinned < kFirstExtra || p.pinned >= kFirstExtra + kMaxExtras ||
@@ -709,9 +745,79 @@ void RosterSelectListLoop(PPCCRRegister& cr, PPCRegister& i, PPCRegister& limit,
   cr.eq = 0;
 }
 
+// Select-screen sections (select_order.txt / group=): after the game's own sort (record
+// +173, one byte, retail ids only), the list is sorted again by (section, name). Entries the
+// sections don't cover (CAWs, templates) stay at the end in the game's order. Default section
+// from the record: brand (+16) 2 = Legends, female (+146) = Divas, not normally playable
+// (+160 != 1) = Managers / GMs, else WWE.
+namespace {
+std::string SectionOf(uint32_t id, uint8_t* base, uint32_t rec) {
+  if (int slot = R::SlotOf(id); slot >= 0 && !R::g_extras[slot].group.empty())
+    return R::g_extras[slot].group;
+  if (auto it = R::g_id_group.find(id); it != R::g_id_group.end()) return it->second;
+  if (base[rec + R::kRecBrand] == 2) return "Legends";
+  if (base[rec + R::kRecFemale]) return "Divas";
+  if (base[rec + R::kRecPlayable] != 1) return "Managers / GMs";
+  return "WWE";
+}
+
+std::string Folded(const char* s, size_t n) {
+  std::string out(s, strnlen(s, n));
+  for (auto& c : out) c = char(std::tolower(uint8_t(c)));
+  return out;
+}
+
+void SortSelectSections(PPCContext& ctx, uint8_t* base, uint32_t block, uint32_t count) {
+  struct Item {
+    uint32_t rank;
+    std::string group, name;
+    std::array<uint8_t, 20> raw;
+  };
+  std::vector<Item> items(count);
+  const uint32_t unlisted = uint32_t(R::g_group_order.size());
+  for (uint32_t i = 0; i < count; ++i) {
+    Item& it = items[i];
+    const uint32_t entry = block + 16 + i * 20;
+    std::memcpy(it.raw.data(), base + entry, 20);
+    const uint32_t id = REX_LOAD_U16(entry + 2);
+    if (id >= R::kRosterCount && !IsExtra(id)) {
+      it.rank = 0xFFFFFFFF;  // CAWs and the rest: last, game's order
+      continue;
+    }
+    uint32_t r;
+    if (const int slot = R::SlotOf(id); slot >= 0) {
+      R::EnsureReady(ctx, base, slot);
+      r = R::RecordAddr(slot);
+    } else {
+      r = R::Call(ctx, base, __imp__sub_821B9A70, id, uint32_t(-1));
+    }
+    it.group = SectionOf(id, base, r);
+    it.name = Folded(reinterpret_cast<const char*>(base + r + R::kRecName), 46);
+    auto pos = std::find(R::g_group_order.begin(), R::g_group_order.end(), it.group);
+    it.rank = pos == R::g_group_order.end() ? unlisted : uint32_t(pos - R::g_group_order.begin());
+  }
+  std::stable_sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
+    if (a.rank != b.rank) return a.rank < b.rank;
+    if (a.rank == 0xFFFFFFFF) return false;
+    if (a.group != b.group) return a.group < b.group;  // sections not in "order", by name
+    return a.name < b.name;
+  });
+  for (uint32_t i = 0; i < count; ++i) std::memcpy(base + block + 16 + i * 20, items[i].raw.data(), 20);
+}
+}  // namespace
+
 REX_HOOK_RAW(sub_822F8C08) {
   const uint32_t game_block = ctx.r3.u32;
-  if (R::g_extras.empty()) return __imp__sub_822F8C08(ctx, base);
+  if (R::g_extras.empty()) {
+    __imp__sub_822F8C08(ctx, base);
+    if (R::g_sections) {
+      const uint32_t count = std::min<uint32_t>(ctx.r3.u32, 123);
+      PPCContext keep = ctx;
+      SortSelectSections(ctx, base, game_block, count);
+      ctx = keep;
+    }
+    return;
+  }
   uint32_t ours;
   {
     std::lock_guard lock(g_list_mutex);
@@ -724,6 +830,11 @@ REX_HOOK_RAW(sub_822F8C08) {
   ctx.r3.u64 = ours;
   __imp__sub_822F8C08(ctx, base);
   const uint32_t count = ctx.r3.u32;
+  if (R::g_sections) {
+    PPCContext keep = ctx;
+    SortSelectSections(ctx, base, ours, count);
+    ctx = keep;
+  }
   std::memcpy(base + game_block, base + ours, std::min<uint32_t>(kGameBlock, 16 + count * 20));
   static uint32_t logged = 0;
   if (count > 123 && count != logged) {
