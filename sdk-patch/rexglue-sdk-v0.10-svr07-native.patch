@@ -1,0 +1,4096 @@
+diff --git a/include/rex/audio/audio_driver.h b/include/rex/audio/audio_driver.h
+index 37ccbf2..269003e 100644
+--- a/include/rex/audio/audio_driver.h
++++ b/include/rex/audio/audio_driver.h
+@@ -11,11 +11,17 @@
+ 
+ #pragma once
+ 
++#include <atomic>
++
+ #include <rex/kernel.h>
+ #include <rex/memory.h>
+ 
+ namespace rex::audio {
+ 
++/// Set by the app (e.g. on window focus loss) to silence output without
++/// stopping the guest audio thread.
++inline std::atomic<bool> g_audio_muted{false};
++
+ class AudioDriver {
+  public:
+   explicit AudioDriver(memory::Memory* memory);
+diff --git a/include/rex/audio/xma/context.h b/include/rex/audio/xma/context.h
+index 8426798..64e304d 100644
+--- a/include/rex/audio/xma/context.h
++++ b/include/rex/audio/xma/context.h
+@@ -266,6 +266,14 @@ class XmaContext {
+ 
+   static void ConvertFrame(const uint8_t** samples, bool is_two_channel, uint8_t* output_buffer);
+ 
++  // Custom ("fake XMA") frames: a frame whose payload starts with
++  // kCustomFrameMagic carries host-decodable audio (IMA ADPCM or linear PCM)
++  // instead of XMA. Modded wave banks keep the XMA tag, so the guest's XACT
++  // streams them like any track, without an XMA encoder.
++  static const uint32_t kCustomFrameMagic = 0x52525841;  // 'RRXA'
++  bool DecodeCustomFrame(XMA_CONTEXT_DATA* data, uint32_t padding_start, uint32_t frame_size,
++                         bool is_loop_end_frame);
++
+   memory::Memory* memory_ = nullptr;
+   std::unique_ptr<rex::thread::Event> work_completion_event_;
+ 
+diff --git a/include/rex/filesystem/devices/host_path_device.h b/include/rex/filesystem/devices/host_path_device.h
+index 48100be..c329f5a 100644
+--- a/include/rex/filesystem/devices/host_path_device.h
++++ b/include/rex/filesystem/devices/host_path_device.h
+@@ -12,6 +12,7 @@
+ #pragma once
+ 
+ #include <string>
++#include <vector>
+ 
+ #include <rex/filesystem/device.h>
+ 
+@@ -37,6 +38,13 @@ class HostPathDevice : public Device {
+   bool allow_share_delete() const { return allow_share_delete_; }
+   const std::filesystem::path& host_path() const { return host_path_; }
+ 
++  // Loose-file overlays: files under these directories replace same-named files
++  // in host_path, and new files are added. The first one added wins. Must be
++  // added before Initialize().
++  void add_overlay_path(const std::filesystem::path& overlay_path) {
++    overlay_paths_.push_back(overlay_path);
++  }
++
+   const std::string& name() const override { return name_; }
+   uint32_t attributes() const override { return 0; }
+   uint32_t component_name_max_length() const override { return 255; }
+@@ -47,10 +55,12 @@ class HostPathDevice : public Device {
+   uint32_t bytes_per_sector() const override { return 0x200; }
+ 
+  private:
+-  void PopulateEntry(HostPathEntry* parent_entry);
++  void PopulateEntry(HostPathEntry* parent_entry,
++                     const std::vector<std::filesystem::path>& overlay_dirs);
+ 
+   std::string name_;
+   std::filesystem::path host_path_;
++  std::vector<std::filesystem::path> overlay_paths_;
+   std::unique_ptr<Entry> root_entry_;
+   bool read_only_;
+   bool allow_share_delete_;
+diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
+index 4d85a2b..b7a77c8 100644
+--- a/include/rex/graphics/shared_memory.h
++++ b/include/rex/graphics/shared_memory.h
+@@ -174,6 +174,12 @@ class SharedMemory {
+   std::vector<uint64_t> system_page_flags_valid_;
+   // Subset of valid pages containing data written by the GPU.
+   std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
++  // gpu_verify_shared_memory debug state.
++  std::vector<uint64_t> debug_page_hashes_;
++  uint64_t debug_stale_page_count_ = 0;
++  std::vector<int64_t> debug_page_upload_time_;
++  uint64_t debug_late_write_count_ = 0;
++  void VerifyValidPages(const std::vector<std::pair<uint32_t, uint32_t>>& ranges);
+   uint32_t num_system_page_flags_ = 0;
+ 
+   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
+diff --git a/include/rex/input/input_system.h b/include/rex/input/input_system.h
+index 1cb3faa..809a2b5 100644
+--- a/include/rex/input/input_system.h
++++ b/include/rex/input/input_system.h
+@@ -10,6 +10,8 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
++#include <functional>
+ #include <memory>
+ #include <vector>
+ 
+@@ -25,6 +27,9 @@ class Window;
+ 
+ namespace rex::input {
+ 
++/// Set by the app (e.g. on window focus loss) to hide the pad from the game.
++inline std::atomic<bool> g_input_blocked{false};
++
+ class InputSystem : public system::IInputSystem {
+  public:
+   explicit InputSystem(rex::ui::Window* window);
+@@ -38,6 +43,9 @@ class InputSystem : public system::IInputSystem {
+   void AddDriver(std::unique_ptr<InputDriver> driver);
+   void AttachWindow(rex::ui::Window* window);
+   void SetActiveCallback(std::function<bool()> callback);
++  /// Called from GetState (user 0) with the merged pad. Return true to hide
++  /// the pad from the game (state is zeroed), e.g. while an overlay owns it.
++  void SetPadHook(std::function<bool(const X_INPUT_GAMEPAD&)> hook);
+ 
+   /// Replaces any previous assignment. Call before the guest starts polling.
+   void SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignment);
+@@ -55,6 +63,7 @@ class InputSystem : public system::IInputSystem {
+   const DeviceInfo* DeviceInfoFor(DeviceId id) const;
+ 
+   rex::ui::Window* window_ = nullptr;
++  std::function<bool(const X_INPUT_GAMEPAD&)> pad_hook_;
+ 
+   std::vector<std::unique_ptr<InputDriver>> drivers_;
+ 
+diff --git a/include/rex/rex_app.h b/include/rex/rex_app.h
+index 1f52480..6e2abf7 100644
+--- a/include/rex/rex_app.h
++++ b/include/rex/rex_app.h
+@@ -298,6 +298,8 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
+   std::unique_ptr<ui::Window> window_;
+   std::thread module_thread_;
+   std::atomic<bool> shutting_down_{false};
++  std::atomic<bool> pad_combo_down_{false};
++  std::function<void()> toggle_settings_;
+   std::unique_ptr<ui::ImmediateDrawer> immediate_drawer_;
+   std::unique_ptr<ui::ImGuiDrawer> imgui_drawer_;
+ 
+diff --git a/include/rex/runtime.h b/include/rex/runtime.h
+index 34f226c..2416350 100644
+--- a/include/rex/runtime.h
++++ b/include/rex/runtime.h
+@@ -18,6 +18,7 @@
+ #include <optional>
+ #include <span>
+ #include <string>
++#include <vector>
+ 
+ #include <rex/cvar.h>
+ #include <rex/embedded_metadata.h>
+@@ -113,6 +114,14 @@ class Runtime {
+   // Global instance accessor - set after Setup() is called
+   static Runtime* instance();
+ 
++  // The loose-file mods folder: the mods_root cvar, else "mods" next to the exe.
++  // Empty when mods are disabled or the folder doesn't exist.
++  static std::filesystem::path ResolveModsRoot();
++
++  // Adds a folder laid over the game files ahead of the mods folder (e.g. files
++  // the app generates from mods). Call before Setup().
++  static void AddModsOverlay(const std::filesystem::path& overlay_path);
++
+   // Subsystem accessors
+   memory::Memory* memory() const { return memory_.get(); }
+   rex::filesystem::VirtualFileSystem* file_system() const { return file_system_.get(); }
+@@ -205,6 +214,7 @@ class Runtime {
+   std::unique_ptr<runtime::ExportResolver> export_resolver_;
+ 
+   static Runtime* instance_;
++  static std::vector<std::filesystem::path> extra_mods_overlays_;
+ };
+ 
+ }  // namespace rex
+diff --git a/include/rex/system/function_dispatcher.h b/include/rex/system/function_dispatcher.h
+index 916f3d6..32b2fbc 100644
+--- a/include/rex/system/function_dispatcher.h
++++ b/include/rex/system/function_dispatcher.h
+@@ -67,6 +67,12 @@ class FunctionDispatcher : public IModuleRegistrar {
+   uint64_t ExecuteInterrupt(ThreadState* thread_state, uint32_t address, uint64_t args[],
+                             size_t arg_count);
+ 
++  /**
++   * True while the calling thread runs a guest interrupt callback (under the
++   * global lock, which ExecuteInterrupt holds for the whole callback).
++   */
++  static bool IsInInterrupt();
++
+   /**
+    * Executes guest code on a thread already running guest code, then restores
+    * its full register state, matching the 360 kernel's trap-frame APC delivery.
+diff --git a/include/rex/system/info/file.h b/include/rex/system/info/file.h
+index ef0a9ad..3c133dc 100644
+--- a/include/rex/system/info/file.h
++++ b/include/rex/system/info/file.h
+@@ -65,7 +65,8 @@ struct X_FILE_BASIC_INFORMATION {
+   be<uint64_t> last_access_time;
+   be<uint64_t> last_write_time;
+   be<uint64_t> change_time;
+-  be<uint64_t> attributes;
++  be<uint32_t> attributes;  // ULONG FileAttributes
++  be<uint32_t> padding;
+ };
+ static_assert_size(X_FILE_BASIC_INFORMATION, 0x28);
+ 
+diff --git a/include/rex/system/xmemory.h b/include/rex/system/xmemory.h
+index 0c39a42..40e54d0 100644
+--- a/include/rex/system/xmemory.h
++++ b/include/rex/system/xmemory.h
+@@ -320,6 +320,17 @@ class PhysicalHeap : public BaseHeap {
+                         uint32_t virtual_address, uint32_t length, bool is_write,
+                         bool unwatch_exact_range, bool unprotect = true);
+ 
++  // Read watches: accessible pages of the range lose all host access in this
++  // view until DisableReadWatch, so the first guest read or write faults and
++  // the data provider can fill them through the host physical view first.
++  // The global critical region must be held. Returns whether any page in the
++  // range is read-watched afterwards.
++  bool EnableReadWatch(uint32_t physical_address, uint32_t length);
++  // Restores the normal protection (read-only where write-watched).
++  void DisableReadWatch(uint32_t physical_address, uint32_t length);
++  bool IsReadWatched(uint32_t virtual_address) const;
++  bool IsPhysicalPageReadWatched(uint32_t physical_address) const;
++
+   uint32_t GetPhysicalAddress(uint32_t address) const;
+ 
+  protected:
+@@ -331,6 +342,17 @@ class PhysicalHeap : public BaseHeap {
+   // pages are large enough to skip reconciling but whose parent's are not.
+   std::unique_lock<std::recursive_mutex> AcquireHostPageReconcileLock() const override;
+ 
++  // System pages of this view covering a physical range; false if none.
++  bool GetSystemPageRange(uint32_t physical_address, uint32_t length, uint32_t& first,
++                          uint32_t& last) const;
++  // Host access of a page without a read watch: the guest's, but read-only
++  // while write-watched.
++  rex::memory::PageAccess GetUnreadWatchedAccess(uint32_t system_page) const;
++  // Drops read watches of the pages, optionally restoring their protection.
++  // For guest operations that set the protection themselves afterwards.
++  void ClearReadWatches(uint32_t system_page_first, uint32_t system_page_last,
++                        bool restore_protection);
++
+   VirtualHeap* parent_heap_;
+ 
+   uint32_t system_page_size_;
+@@ -340,6 +362,9 @@ class PhysicalHeap : public BaseHeap {
+     // Whether writing to each page should result trigger invalidation
+     // callbacks.
+     uint64_t notify_on_invalidation;
++    // Whether the page is hidden (no host access) until the data provider
++    // fills it.
++    uint64_t notify_on_read;
+   };
+   // Protected by global_critical_region. Flags for each 64 system pages,
+   // interleaved as blocks, so bit scan can be used to quickly extract ranges.
+@@ -479,8 +504,23 @@ class Memory {
+   //
+   // - Data providers:
+   //
+-  // TODO(Triang3l): Implement data providers - more complicated because they
+-  // will need to be able to release the global lock.
++  // One provider (the GPU): read-watched pages have no host access in the
++  // guest views, and the first guest access to one calls the provider with the
++  // global lock (held once). The provider may release the lock, must write the
++  // data through the host physical view and DisablePhysicalMemoryReadWatch the
++  // pages, and returns true to retry the access.
++  typedef bool (*PhysicalMemoryDataProvider)(
++      void* context, uint32_t physical_address,
++      std::unique_lock<std::recursive_mutex> global_lock_locked_once);
++  void SetPhysicalMemoryDataProvider(PhysicalMemoryDataProvider provider, void* context);
++  // Both take the global lock. Enable returns whether any page is read-watched.
++  bool EnablePhysicalMemoryReadWatch(uint32_t physical_address, uint32_t length);
++  void DisablePhysicalMemoryReadWatch(uint32_t physical_address, uint32_t length);
++  // The global lock must be held.
++  bool IsPhysicalMemoryReadWatched(uint32_t physical_address) const;
++  // For host code about to read guest memory through a virtual view without
++  // fault handling (file writes): calls the provider for watched pages.
++  void ProvidePhysicalMemoryData(uint32_t virtual_address, uint32_t length);
+ 
+   // Returns start and length of the smallest physical memory region surrounding
+   // the watched region that can be safely unwatched, if it doesn't matter,
+@@ -624,6 +664,8 @@ class Memory {
+   rex::thread::global_critical_region global_critical_region_;
+   std::vector<std::pair<PhysicalMemoryInvalidationCallback, void*>*>
+       physical_memory_invalidation_callbacks_;
++  PhysicalMemoryDataProvider physical_memory_data_provider_ = nullptr;
++  void* physical_memory_data_provider_context_ = nullptr;
+ };
+ 
+ }  // namespace rex::memory
+diff --git a/include/rex/ui/imgui_dialog.h b/include/rex/ui/imgui_dialog.h
+index a7ab6b3..8143250 100644
+--- a/include/rex/ui/imgui_dialog.h
++++ b/include/rex/ui/imgui_dialog.h
+@@ -39,6 +39,10 @@ class ImGuiDialog {
+ 
+   void Draw();
+ 
++  // SVR07: an idle dialog (e.g. an empty notification queue) does not need the
++  // UI to be repainted continuously at the monitor refresh rate.
++  virtual bool IsIdle() { return false; }
++
+  protected:
+   ImGuiDialog(ImGuiDrawer* imgui_drawer);
+ 
+diff --git a/include/rex/ui/imgui_drawer.h b/include/rex/ui/imgui_drawer.h
+index a570fa0..983fe09 100644
+--- a/include/rex/ui/imgui_drawer.h
++++ b/include/rex/ui/imgui_drawer.h
+@@ -12,6 +12,7 @@
+ #ifndef REX_UI_IMGUI_DRAWER_H_
+ #define REX_UI_IMGUI_DRAWER_H_
+ 
++#include <atomic>
+ #include <cstddef>
+ #include <cstdint>
+ #include <functional>
+@@ -40,6 +41,9 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
+   ~ImGuiDrawer();
+ 
+   ImGuiIO& GetIO();
++  // Latest pad state for ImGui navigation (thread-safe; call from any thread).
++  // active=false releases all pad keys and turns pad navigation off.
++  void SetGamepadInput(bool active, uint16_t buttons, int16_t lx, int16_t ly);
+ 
+   // Per-overlay styling, patched by the consumer in OnConfigureStyle.
+   Style& style() { return style_; }
+@@ -76,6 +80,10 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
+ 
+  private:
+   void Initialize();
++  void ApplyGamepadInput(ImGuiIO& io);
++  std::atomic<uint64_t> gamepad_packed_{0};  // bit 63 = active
++  uint16_t gamepad_prev_buttons_ = 0;
++  bool gamepad_prev_active_ = false;
+ 
+   void SetupFontTexture();
+ 
+diff --git a/include/rex/ui/overlay/achievement_toast.h b/include/rex/ui/overlay/achievement_toast.h
+index 7642601..135d7a5 100644
+--- a/include/rex/ui/overlay/achievement_toast.h
++++ b/include/rex/ui/overlay/achievement_toast.h
+@@ -35,6 +35,8 @@ class AchievementToastDialog : public AchievementNotificationDialog {
+   // Thread-safe: safe to call from any thread, including guest threads.
+   void Push(const rex::system::AchievementEvent& event) override;
+ 
++  bool IsIdle() override;
++
+  protected:
+   void OnDraw(ImGuiIO& io) override;
+ 
+diff --git a/include/rex/ui/overlay/settings_overlay.h b/include/rex/ui/overlay/settings_overlay.h
+index 5b80eac..61232f3 100644
+--- a/include/rex/ui/overlay/settings_overlay.h
++++ b/include/rex/ui/overlay/settings_overlay.h
+@@ -11,6 +11,7 @@
+  */
+ #pragma once
+ #include <filesystem>
++#include <functional>
+ #include <string>
+ #include <rex/ui/imgui_dialog.h>
+ 
+@@ -19,14 +20,32 @@ namespace rex::ui {
+ class SettingsDialog : public ImGuiDialog {
+  public:
+   // config_path: where "Save to config" writes (e.g. exe_dir / "app.toml")
+-  SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path);
++  // on_quit: "Quit game" button (hidden when empty). set_fullscreen/is_fullscreen: live toggle.
++  SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path,
++                 std::function<void()> on_quit = {}, std::function<void(bool)> set_fullscreen = {},
++                 std::function<bool()> is_fullscreen = {});
+   ~SettingsDialog();
+ 
++  // Called when the pad's B button (or Escape) is pressed with no popup open.
++  void set_on_close(std::function<void()> fn) { on_close_ = std::move(fn); }
++  // Folder holding the saves, for the backup / restore buttons.
++  void set_saves_dir(std::filesystem::path dir) { saves_dir_ = std::move(dir); }
++
+  protected:
+   void OnDraw(ImGuiIO& io) override;
+ 
+  private:
++  void DrawQuickSettings();
++
+   std::filesystem::path config_path_;
++  std::function<void()> on_quit_;
++  std::function<void(bool)> set_fullscreen_;
++  std::function<bool()> is_fullscreen_;
++  std::function<void()> on_close_;
++  std::filesystem::path saves_dir_;
++  bool popup_open_prev_ = false;
++  bool confirm_restore_ = false;
++  std::string save_status_;
+   char search_buf_[128] = {};
+   std::string selected_category_;
+   std::string capturing_bind_name_;
+diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
+index 20a2cd8..924b0c4 100644
+--- a/src/audio/sdl/sdl_audio_driver.cpp
++++ b/src/audio/sdl/sdl_audio_driver.cpp
+@@ -123,6 +123,8 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+   }
+ 
+   std::memcpy(output_frame, input_frame, frame_samples_ * sizeof(float));
++  if (g_audio_muted.load(std::memory_order_relaxed))
++    std::memset(output_frame, 0, frame_samples_ * sizeof(float));
+ 
+   static uint32_t sdl_submit_count = 0;
+   if (sdl_submit_count < 10) {
+diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
+index 11b83be..dbd27c1 100644
+--- a/src/audio/xma_context.cpp
++++ b/src/audio/xma_context.cpp
+@@ -658,6 +658,9 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+   const uint32_t padding_start =
+       static_cast<uint8_t>(stream.Copy(xma_frame_.data() + 1, packet_info.current_frame_size_));
+ 
++  if (DecodeCustomFrame(data, padding_start, packet_info.current_frame_size_, is_loop_end_frame)) {
++    // Own audio already sits in raw_frame_; only the next-offset step remains.
++  } else {
+   decoded_frame_.fill(0);
+ 
+   if (PrepareDecoder(data->sample_rate, bool(data->is_stereo)) == 1) {
+@@ -708,6 +711,7 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+     // two blocks that are not neighbors.
+     carry_valid_ = false;
+   }
++  }
+ 
+   // Compute where to go next.
+   if (is_loop_end_frame) {
+@@ -740,6 +744,104 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+   data->input_buffer_read_offset = next_input_offset;
+ }
+ 
++bool XmaContext::DecodeCustomFrame(XMA_CONTEXT_DATA* data, uint32_t padding_start,
++                                   uint32_t frame_size, bool is_loop_end_frame) {
++  // Frame bits start after the PreparePacket byte and the copy's lead-in bits.
++  const uint8_t* bits = xma_frame_.data();
++  size_t pos = 8 + padding_start + kBitsPerFrameHeader;
++  const size_t end = 8 + padding_start + frame_size;
++  auto read = [&](uint32_t n) -> uint32_t {
++    uint32_t v = 0;
++    for (uint32_t i = 0; i < n; i++, pos++) {
++      v = (v << 1) | ((bits[pos >> 3] >> (7 - (pos & 7))) & 1);
++    }
++    return v;
++  };
++  if (frame_size < kBitsPerFrameHeader + 40 || read(32) != kCustomFrameMagic) {
++    return false;
++  }
++
++  // Header: codec:4 (1 = IMA ADPCM, 2 = linear PCM), channels:4, then per codec.
++  const uint32_t codec = read(4);
++  const uint32_t channels = read(4);
++  static std::atomic<uint32_t> logged{0};
++  if (logged.fetch_add(1) == 0) {
++    REXAPU_INFO("XmaContext {}: custom RRXA audio stream (codec {}, {} ch)", id(), codec, channels);
++  }
++  const uint32_t out_channels = data->is_stereo ? 2 : 1;
++  std::array<int16_t, kSamplesPerFrame * 2> pcm{};
++
++  if (codec == 1 && (channels == 1 || channels == 2) &&
++      pos + channels * 23 + kSamplesPerFrame * channels * 4 <= end) {
++    static const int16_t kSteps[89] = {
++        7,     8,     9,     10,    11,    12,    13,    14,    16,    17,    19,    21,    23,
++        25,    28,    31,    34,    37,    41,    45,    50,    55,    60,    66,    73,    80,
++        88,    97,    107,   118,   130,   143,   157,   173,   190,   209,   230,   253,   279,
++        307,   337,   371,   408,   449,   494,   544,   598,   658,   724,   796,   876,   963,
++        1060,  1166,  1282,  1411,  1552,  1707,  1878,  2066,  2272,  2499,  2749,  3024,  3327,
++        3660,  4026,  4428,  4871,  5358,  5894,  6484,  7132,  7845,  8630,  9493,  10442, 11487,
++        12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767};
++    static const int8_t kIndexAdjust[8] = {-1, -1, -1, -1, 2, 4, 6, 8};
++    int32_t pred[2], index[2];
++    for (uint32_t c = 0; c < channels; c++) {
++      pred[c] = static_cast<int16_t>(read(16));
++      index[c] = std::min<int32_t>(read(7), 88);
++    }
++    for (uint32_t s = 0; s < kSamplesPerFrame; s++) {
++      for (uint32_t c = 0; c < channels; c++) {
++        const uint32_t n = read(4);
++        const int32_t step = kSteps[index[c]];
++        int32_t diff = step >> 3;
++        if (n & 1) diff += step >> 2;
++        if (n & 2) diff += step >> 1;
++        if (n & 4) diff += step;
++        pred[c] = std::clamp<int32_t>((n & 8) ? pred[c] - diff : pred[c] + diff, -32768, 32767);
++        index[c] = std::clamp<int32_t>(index[c] + kIndexAdjust[n & 7], 0, 88);
++        pcm[s * 2 + c] = static_cast<int16_t>(pred[c]);
++      }
++      if (channels == 1) pcm[s * 2 + 1] = pcm[s * 2];
++    }
++  } else if (codec == 2 && (channels == 1 || channels == 2)) {
++    const uint32_t sample_bits = read(4) + 1;
++    if (sample_bits >= 8 && pos + kSamplesPerFrame * channels * sample_bits <= end) {
++      for (uint32_t s = 0; s < kSamplesPerFrame; s++) {
++        for (uint32_t c = 0; c < channels; c++) {
++          pcm[s * 2 + c] = static_cast<int16_t>(read(sample_bits) << (16 - sample_bits));
++        }
++        if (channels == 1) pcm[s * 2 + 1] = pcm[s * 2];
++      }
++    } else {
++      REXAPU_ERROR("XmaContext {}: bad custom PCM frame", id());
++    }
++  } else {
++    REXAPU_ERROR("XmaContext {}: bad custom frame (codec {}, channels {})", id(), codec, channels);
++  }
++
++  // Output: big-endian s16, interleaved when the context is stereo. Unlike
++  // ffmpeg there is no decoder delay, so the frame goes out right away.
++  auto out = reinterpret_cast<uint16_t*>(raw_frame_.data());
++  for (uint32_t s = 0; s < kSamplesPerFrame; s++) {
++    if (out_channels == 2) {
++      out[s * 2] = rex::byte_swap(static_cast<uint16_t>(pcm[s * 2]));
++      out[s * 2 + 1] = rex::byte_swap(static_cast<uint16_t>(pcm[s * 2 + 1]));
++    } else {
++      out[s] = rex::byte_swap(static_cast<uint16_t>((pcm[s * 2] + pcm[s * 2 + 1]) / 2));
++    }
++  }
++
++  carry_valid_ = false;
++  current_frame_remaining_subframes_ = 4 << data->is_stereo;
++  loop_frame_output_limit_ =
++      is_loop_end_frame ? static_cast<uint8_t>((data->loop_subframe_end + 1) << data->is_stereo) : 0;
++  if (loop_start_skip_pending_) {
++    current_frame_remaining_subframes_ -= std::min<uint8_t>(
++        static_cast<uint8_t>(data->loop_subframe_skip << data->is_stereo),
++        current_frame_remaining_subframes_);
++    loop_start_skip_pending_ = false;
++  }
++  return true;
++}
++
+ void XmaContext::ConvertFrame(const uint8_t** samples, bool is_two_channel,
+                               uint8_t* output_buffer) {
+   // Loop through every sample, convert and drop it into the output array.
+diff --git a/src/codegen/builders/vector.cpp b/src/codegen/builders/vector.cpp
+index cbdd7f7..acff5b8 100644
+--- a/src/codegen/builders/vector.cpp
++++ b/src/codegen/builders/vector.cpp
+@@ -184,22 +184,37 @@ bool build_vlogefp(BuilderContext& ctx) {
+ //=============================================================================
+ 
+ bool build_vmsum3fp128(BuilderContext& ctx) {
+-  // 3-element dot product accounting for guest->host vector element reversal
+-  // 0xEF = dot(yzw) with result broadcast to all elements (see constants doc)
++  // Dot product with broadcast. Hardware returns QNaN when a dot of finite inputs overflows
++  // (rexglue-sdk#491), while SSE gives +/-inf.
+   ctx.emit_set_flush_mode(true);
+   ctx.println(
+-      "\tsimde_mm_store_ps({}.f32, simde_mm_dp_ps(simde_mm_load_ps({}.f32), "
+-      "simde_mm_load_ps({}.f32), 0xEF));",
++      "	{{ simde__m128 _a = simde_mm_load_ps({1}.f32), _b = simde_mm_load_ps({2}.f32); "
++      "simde__m128 _dp = simde_mm_dp_ps(_a, _b, 0xEF); "
++      "simde__m128 _sg = simde_mm_set1_ps(-0.0f), _inf = simde_mm_set1_ps(INFINITY); "
++      "simde__m128 _fin = simde_mm_and_ps(simde_mm_cmplt_ps(simde_mm_andnot_ps(_sg, _a), _inf), "
++      "simde_mm_cmplt_ps(simde_mm_andnot_ps(_sg, _b), _inf)); "
++      "if (simde_mm_movemask_ps(_fin) == 0xF && "
++      "simde_mm_movemask_ps(simde_mm_cmpeq_ps(simde_mm_andnot_ps(_sg, _dp), _inf)) != 0) "
++      "_dp = simde_mm_set1_ps(__builtin_nanf(\"\")); "
++      "simde_mm_store_ps({0}.f32, _dp); }}",
+       ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]));
+   return true;
+ }
+ 
+ bool build_vmsum4fp128(BuilderContext& ctx) {
+-  // 4-element dot product: 0xFF = all 4 elements, result to all (see constants doc)
++  // Dot product with broadcast. Hardware returns QNaN when a dot of finite inputs overflows
++  // (rexglue-sdk#491), while SSE gives +/-inf.
+   ctx.emit_set_flush_mode(true);
+   ctx.println(
+-      "\tsimde_mm_store_ps({}.f32, simde_mm_dp_ps(simde_mm_load_ps({}.f32), "
+-      "simde_mm_load_ps({}.f32), 0xFF));",
++      "	{{ simde__m128 _a = simde_mm_load_ps({1}.f32), _b = simde_mm_load_ps({2}.f32); "
++      "simde__m128 _dp = simde_mm_dp_ps(_a, _b, 0xFF); "
++      "simde__m128 _sg = simde_mm_set1_ps(-0.0f), _inf = simde_mm_set1_ps(INFINITY); "
++      "simde__m128 _fin = simde_mm_and_ps(simde_mm_cmplt_ps(simde_mm_andnot_ps(_sg, _a), _inf), "
++      "simde_mm_cmplt_ps(simde_mm_andnot_ps(_sg, _b), _inf)); "
++      "if (simde_mm_movemask_ps(_fin) == 0xF && "
++      "simde_mm_movemask_ps(simde_mm_cmpeq_ps(simde_mm_andnot_ps(_sg, _dp), _inf)) != 0) "
++      "_dp = simde_mm_set1_ps(__builtin_nanf(\"\")); "
++      "simde_mm_store_ps({0}.f32, _dp); }}",
+       ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]));
+   return true;
+ }
+@@ -1278,29 +1293,29 @@ bool build_vpkd3d128(BuilderContext& ctx) {
+ 
+     case 3:  // FLOAT16_2 - pack 2 floats to 2 float16s
+     {
+-      // Pack 2 elements into 32 bits (1 word)
+-      // Guest element 0 goes to high 16 bits, element 1 to low 16 bits
+-      // Output u16 index = (1-i) + 2*shift for element i
++      // Snapshot the source first: vD may alias vB (in-place pack), and writing the destination
++      // halfwords would otherwise corrupt source words that are read later (rexglue-sdk#457).
++      ctx.println("	{{ const uint32_t _vpks[4] = {{{0}.u32[0], {0}.u32[1], {0}.u32[2], {0}.u32[3]}};",
++                  ctx.v(ctx.insn.operands[1]));
+       for (size_t i = 0; i < 2; i++) {
+         size_t srcIdx = 3 - i;  // Guest element i is at host array index 3-i
+-        size_t dstIdx =
+-            (1 - i) + (2 * ctx.insn.operands[4]);  // Output reversed: elem 0 to high, elem 1 to low
+-        ctx.println("\t{}.u32 = ({}.u32[{}]&0x7FFFFFFF);", ctx.temp(), ctx.v(ctx.insn.operands[1]),
+-                    srcIdx);
++        size_t dstIdx = (1 - i) + (2 * ctx.insn.operands[4]);
++        ctx.println("	{}.u32 = (_vpks[{}]&0x7FFFFFFF);", ctx.temp(), srcIdx);
+         ctx.println(
+-            "\t{0}.u8[0] = ({1}.f32 != {1}.f32) || ({1}.f32 > 65504.0f) ? 0xFF : "
+-            "(({2}.u32[{3}]&0x7f800000)>>23);",
+-            ctx.v_temp(), ctx.temp(), ctx.v(ctx.insn.operands[1]), srcIdx);
+-        ctx.println("\t{}.u16 = {}.u8[0] != 0xFF ? (({}.u32[{}]&0x7FE000)>>13) : 0x0;", ctx.temp(),
+-                    ctx.v_temp(), ctx.v(ctx.insn.operands[1]), srcIdx);
++            "	{0}.u8[0] = ({1}.f32 != {1}.f32) || ({1}.f32 > 65504.0f) ? 0xFF : "
++            "((_vpks[{2}]&0x7f800000)>>23);",
++            ctx.v_temp(), ctx.temp(), srcIdx);
++        ctx.println("	{}.u16 = {}.u8[0] != 0xFF ? ((_vpks[{}]&0x7FE000)>>13) : 0x0;", ctx.temp(),
++                    ctx.v_temp(), srcIdx);
+         ctx.println(
+-            "\t{0}.u16[{1}] = {2}.u8[0] != 0xFF ? ({2}.u8[0] > 0x70 ? "
++            "	{0}.u16[{1}] = {2}.u8[0] != 0xFF ? ({2}.u8[0] > 0x70 ? "
+             "((({2}.u8[0]-0x70)<<10)+{3}.u16) : (0x71-{2}.u8[0] > 31 ? 0x0 : "
+             "((0x400+{3}.u16)>>(0x71-{2}.u8[0])))) : 0x7FFF;",
+             ctx.v(ctx.insn.operands[0]), dstIdx, ctx.v_temp(), ctx.temp());
+-        ctx.println("\t{}.u16[{}] |= (({}.u32[{}]&0x80000000)>>16);", ctx.v(ctx.insn.operands[0]),
+-                    dstIdx, ctx.v(ctx.insn.operands[1]), srcIdx);
++        ctx.println("	{}.u16[{}] |= ((_vpks[{}]&0x80000000)>>16);", ctx.v(ctx.insn.operands[0]),
++                    dstIdx, srcIdx);
+       }
++      ctx.println("	}}");
+       break;
+     }
+ 
+@@ -1324,31 +1339,31 @@ bool build_vpkd3d128(BuilderContext& ctx) {
+ 
+     case 5:  // float16_4
+     {
+-      // Pack 4 elements into 64 bits (4 x 16-bit floats)
+-      // Guest element 0 goes to highest 16-bit position, element 3 to lowest
+-      // Output u16 index = (3-i) + 2*shift for element i
+       if (ctx.insn.operands[3] != 2 || ctx.insn.operands[4] > 2)
+         REXCODEGEN_WARN("Unexpected float16_4 pack instruction at {:X}", ctx.base);
+-
++      // Snapshot the source first: vD may alias vB (in-place pack), and writing the destination
++      // halfwords would otherwise corrupt source words that are read later (rexglue-sdk#457).
++      ctx.println("	{{ const uint32_t _vpks[4] = {{{0}.u32[0], {0}.u32[1], {0}.u32[2], {0}.u32[3]}};",
++                  ctx.v(ctx.insn.operands[1]));
+       for (size_t i = 0; i < 4; i++) {
+         size_t srcIdx = 3 - i;  // Guest element i is at host array index 3-i
+-        size_t dstIdx = (3 - i) + (2 * ctx.insn.operands[4]);  // Output also reversed
+-        ctx.println("\t{}.u32 = ({}.u32[{}]&0x7FFFFFFF);", ctx.temp(), ctx.v(ctx.insn.operands[1]),
+-                    srcIdx);
++        size_t dstIdx = (3 - i) + (2 * ctx.insn.operands[4]);
++        ctx.println("	{}.u32 = (_vpks[{}]&0x7FFFFFFF);", ctx.temp(), srcIdx);
+         ctx.println(
+-            "\t{0}.u8[0] = ({1}.f32 != {1}.f32) || ({1}.f32 > 65504.0f) ? 0xFF : "
+-            "(({2}.u32[{3}]&0x7f800000)>>23);",
+-            ctx.v_temp(), ctx.temp(), ctx.v(ctx.insn.operands[1]), srcIdx);
+-        ctx.println("\t{}.u16 = {}.u8[0] != 0xFF ? (({}.u32[{}]&0x7FE000)>>13) : 0x0;", ctx.temp(),
+-                    ctx.v_temp(), ctx.v(ctx.insn.operands[1]), srcIdx);
++            "	{0}.u8[0] = ({1}.f32 != {1}.f32) || ({1}.f32 > 65504.0f) ? 0xFF : "
++            "((_vpks[{2}]&0x7f800000)>>23);",
++            ctx.v_temp(), ctx.temp(), srcIdx);
++        ctx.println("	{}.u16 = {}.u8[0] != 0xFF ? ((_vpks[{}]&0x7FE000)>>13) : 0x0;", ctx.temp(),
++                    ctx.v_temp(), srcIdx);
+         ctx.println(
+-            "\t{0}.u16[{1}] = {2}.u8[0] != 0xFF ? ({2}.u8[0] > 0x70 ? "
++            "	{0}.u16[{1}] = {2}.u8[0] != 0xFF ? ({2}.u8[0] > 0x70 ? "
+             "((({2}.u8[0]-0x70)<<10)+{3}.u16) : (0x71-{2}.u8[0] > 31 ? 0x0 : "
+             "((0x400+{3}.u16)>>(0x71-{2}.u8[0])))) : 0x7FFF;",
+             ctx.v(ctx.insn.operands[0]), dstIdx, ctx.v_temp(), ctx.temp());
+-        ctx.println("\t{}.u16[{}] |= (({}.u32[{}]&0x80000000)>>16);", ctx.v(ctx.insn.operands[0]),
+-                    dstIdx, ctx.v(ctx.insn.operands[1]), srcIdx);
++        ctx.println("	{}.u16[{}] |= ((_vpks[{}]&0x80000000)>>16);", ctx.v(ctx.insn.operands[0]),
++                    dstIdx, srcIdx);
+       }
++      ctx.println("	}}");
+       break;
+     }
+ 
+diff --git a/src/core/cvar.cpp b/src/core/cvar.cpp
+index 228728d..53af1a4 100644
+--- a/src/core/cvar.cpp
++++ b/src/core/cvar.cpp
+@@ -535,13 +535,35 @@ std::vector<std::string> ListModifiedFlags() {
+   return result;
+ }
+ 
++// SVR07: Windows paths contain backslashes, which are escapes in TOML basic
++// strings; unescaped they made the whole saved config fail to parse on the next
++// launch (all settings silently reset).
++static std::string EscapeTomlString(const std::string& value) {
++  std::string out;
++  out.reserve(value.size());
++  for (char c : value) {
++    if (c == '\\' || c == '"') {
++      out += '\\';
++    }
++    out += c;
++  }
++  return out;
++}
++
++// Values given on the command line or via environment are one-off launch
++// overrides (e.g. --user_data_root from a launcher); don't bake them into the file.
++template <typename Entry>
++static bool IsPersistedSource(const Entry& entry) {
++  return entry.source != Source::kCommandLine && entry.source != Source::kEnvironment;
++}
++
+ std::string SerializeToTOML() {
+   std::lock_guard lock(GetRegistryMutex());
+   std::string result;
+   for (const auto& entry : GetRegistryStorage()) {
+-    if (entry.getter() != entry.default_value) {
++    if (entry.getter() != entry.default_value && IsPersistedSource(entry)) {
+       if (entry.type == FlagType::String) {
+-        result += entry.name + " = \"" + entry.getter() + "\"\n";
++        result += entry.name + " = \"" + EscapeTomlString(entry.getter()) + "\"\n";
+       } else {
+         result += entry.name + " = " + entry.getter() + "\n";
+       }
+@@ -554,9 +576,10 @@ std::string SerializeToTOML(std::string_view category) {
+   std::lock_guard lock(GetRegistryMutex());
+   std::string result;
+   for (const auto& entry : GetRegistryStorage()) {
+-    if (entry.category == category && entry.getter() != entry.default_value) {
++    if (entry.category == category && entry.getter() != entry.default_value &&
++        IsPersistedSource(entry)) {
+       if (entry.type == FlagType::String) {
+-        result += entry.name + " = \"" + entry.getter() + "\"\n";
++        result += entry.name + " = \"" + EscapeTomlString(entry.getter()) + "\"\n";
+       } else {
+         result += entry.name + " = " + entry.getter() + "\n";
+       }
+diff --git a/src/core/exception_handler_win.cpp b/src/core/exception_handler_win.cpp
+index 4a9b1ee..c23c152 100644
+--- a/src/core/exception_handler_win.cpp
++++ b/src/core/exception_handler_win.cpp
+@@ -15,9 +15,20 @@
+ 
+ #include "platform_win.h"
+ 
++#include <dbghelp.h>
++
++#include <atomic>
++#include <cwchar>
++#include <filesystem>
++#include <string>
++
+ #include <rex/assert.h>
++#include <rex/cvar.h>
++#include <rex/logging.h>
+ #include <rex/math.h>
+ 
++REXCVAR_DECLARE(std::string, log_file);
++
+ namespace rex::arch {
+ 
+ // Handle of the added VectoredExceptionHandler.
+@@ -101,9 +112,86 @@ LONG CALLBACK ExceptionHandlerCallback(PEXCEPTION_POINTERS ex_info) {
+   return EXCEPTION_CONTINUE_SEARCH;
+ }
+ 
++LPTOP_LEVEL_EXCEPTION_FILTER previous_unhandled_filter_ = nullptr;
++
++// Last chance for a crash nothing handled: writes a minidump next to the log
++// and logs where it is, so an exit to the desktop with no WER record leaves a
++// trace. Stack overflows and fail-fast exits can still bypass it.
++LONG WINAPI UnhandledExceptionFilterCallback(PEXCEPTION_POINTERS ex_info) {
++  static std::atomic<bool> entered{false};
++  if (entered.exchange(true)) {
++    return EXCEPTION_CONTINUE_SEARCH;
++  }
++  const EXCEPTION_RECORD* record = ex_info->ExceptionRecord;
++
++  // The dump first: logging can fail in a broken process.
++  std::filesystem::path dump_path;
++  bool dumped = false;
++  {
++    std::error_code error;
++    std::filesystem::path dump_dir;
++    const std::string& log_path = REXCVAR_GET(log_file);
++    if (!log_path.empty()) {
++      dump_dir = std::filesystem::path(log_path).parent_path();
++    }
++    if (dump_dir.empty()) {
++      dump_dir = std::filesystem::current_path(error);
++    }
++    SYSTEMTIME time;
++    GetLocalTime(&time);
++    wchar_t dump_name[64];
++    std::swprintf(dump_name, rex::countof(dump_name), L"crash-%04u%02u%02u-%02u%02u%02u.dmp",
++                  time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond);
++    dump_path = dump_dir / dump_name;
++
++    using MiniDumpWriteDumpFunction =
++        BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, PMINIDUMP_EXCEPTION_INFORMATION,
++                      PMINIDUMP_USER_STREAM_INFORMATION, PMINIDUMP_CALLBACK_INFORMATION);
++    HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll");
++    auto mini_dump_write_dump =
++        dbghelp ? reinterpret_cast<MiniDumpWriteDumpFunction>(
++                      GetProcAddress(dbghelp, "MiniDumpWriteDump"))
++                : nullptr;
++    if (mini_dump_write_dump) {
++      HANDLE file = CreateFileW(dump_path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
++                                FILE_ATTRIBUTE_NORMAL, nullptr);
++      if (file != INVALID_HANDLE_VALUE) {
++        MINIDUMP_EXCEPTION_INFORMATION exception_information;
++        exception_information.ThreadId = GetCurrentThreadId();
++        exception_information.ExceptionPointers = ex_info;
++        exception_information.ClientPointers = FALSE;
++        // Not the guest memory (gigabytes of reserved views).
++        dumped = mini_dump_write_dump(
++                     GetCurrentProcess(), GetCurrentProcessId(), file,
++                     MINIDUMP_TYPE(MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithDataSegs |
++                                   MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules),
++                     &exception_information, nullptr, nullptr) != FALSE;
++        CloseHandle(file);
++      }
++    }
++  }
++
++  REXLOG_ERROR(
++      "Unhandled exception {:08X} at {:016X} on thread {:X} (info {:X}, {:016X}); minidump {}: {}",
++      uint32_t(record->ExceptionCode), uint64_t(uintptr_t(record->ExceptionAddress)),
++      GetCurrentThreadId(), record->NumberParameters > 0 ? record->ExceptionInformation[0] : 0,
++      record->NumberParameters > 1 ? record->ExceptionInformation[1] : 0,
++      dumped ? "written" : "FAILED", dump_path.string());
++
++  if (previous_unhandled_filter_) {
++    return previous_unhandled_filter_(ex_info);
++  }
++  return EXCEPTION_CONTINUE_SEARCH;
++}
++
+ void ExceptionHandler::Install(Handler fn, void* data) {
+   if (!veh_handle_) {
+     veh_handle_ = AddVectoredExceptionHandler(1, ExceptionHandlerCallback);
++    static bool unhandled_filter_installed = false;
++    if (!unhandled_filter_installed) {
++      unhandled_filter_installed = true;
++      previous_unhandled_filter_ = SetUnhandledExceptionFilter(UnhandledExceptionFilterCallback);
++    }
+ 
+     if (IsDebuggerPresent()) {
+       // TODO(benvanik): do we need a continue handler if a debugger is
+diff --git a/src/core/filesystem_win.cpp b/src/core/filesystem_win.cpp
+index c5a2c5d..a15be07 100644
+--- a/src/core/filesystem_win.cpp
++++ b/src/core/filesystem_win.cpp
+@@ -43,9 +43,20 @@ std::filesystem::path to_path(const std::u16string_view source) {
+ namespace filesystem {
+ 
+ std::filesystem::path GetExecutablePath() {
+-  wchar_t* path;
+-  auto error = _get_wpgmptr(&path);
+-  return !error ? std::filesystem::path(path) : std::filesystem::path();
++  // _get_wpgmptr is null in a console exe with a narrow main() (rexglue.exe codegen) and the UCRT then
++  // aborts with an invalid-parameter fast-fail; ask the loader instead.
++  std::wstring buffer(MAX_PATH, L'\0');
++  for (;;) {
++    DWORD n = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
++    if (n == 0) {
++      return std::filesystem::path();
++    }
++    if (n < buffer.size()) {
++      buffer.resize(n);
++      return std::filesystem::path(buffer);
++    }
++    buffer.resize(buffer.size() * 2);
++  }
+ }
+ 
+ std::filesystem::path GetExecutableFolder() {
+diff --git a/src/core/logging.cpp b/src/core/logging.cpp
+index 1645848..cd55250 100644
+--- a/src/core/logging.cpp
++++ b/src/core/logging.cpp
+@@ -9,6 +9,7 @@
+  *              See LICENSE file in the project root for full license text.
+  */
+ 
++#include <chrono>
+ #include <algorithm>
+ #include <cctype>
+ #include <charconv>
+@@ -232,6 +233,9 @@ void InitLogging(const LogConfig& config) {
+     sink->set_level(spdlog::level::trace);
+     sink->set_pattern(config.file_pattern);
+     g_file_sink = sink;
++    // flush_on() only covers warnings and above; without this, info lines from
++    // the moments before a hard crash never reach the file.
++    spdlog::flush_every(std::chrono::seconds(1));
+   }
+ 
+   g_extra_sinks = config.extra_sinks;
+diff --git a/src/filesystem/devices/host_path_device.cpp b/src/filesystem/devices/host_path_device.cpp
+index f68b79a..cfdb546 100644
+--- a/src/filesystem/devices/host_path_device.cpp
++++ b/src/filesystem/devices/host_path_device.cpp
+@@ -46,7 +46,17 @@ bool HostPathDevice::Initialize() {
+   auto root_entry = new HostPathEntry(this, nullptr, "", host_path_);
+   root_entry->attributes_ = kFileAttributeDirectory;
+   root_entry_ = std::unique_ptr<Entry>(root_entry);
+-  PopulateEntry(root_entry);
++  std::vector<std::filesystem::path> overlay_dirs;
++  for (const auto& overlay_path : overlay_paths_) {
++    std::error_code ec;
++    if (std::filesystem::is_directory(overlay_path, ec)) {
++      REXFS_INFO("Mods overlay enabled: {}", rex::path_to_utf8(overlay_path));
++      overlay_dirs.push_back(overlay_path);
++    } else {
++      REXFS_INFO("Mods overlay folder not found, skipping: {}", rex::path_to_utf8(overlay_path));
++    }
++  }
++  PopulateEntry(root_entry, overlay_dirs);
+ 
+   return true;
+ }
+@@ -113,15 +123,67 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
+   return current_entry;
+ }
+ 
+-void HostPathDevice::PopulateEntry(HostPathEntry* parent_entry) {
++void HostPathDevice::PopulateEntry(HostPathEntry* parent_entry,
++                                   const std::vector<std::filesystem::path>& overlay_dirs) {
++  using Type = rex::filesystem::FileInfo::Type;
++
++  // The overlay directories (in priority order) that hold `name` with the given type.
++  auto overlays_with = [&](const std::filesystem::path& name, Type type) {
++    std::vector<std::filesystem::path> found;
++    for (const auto& overlay_dir : overlay_dirs) {
++      rex::filesystem::FileInfo info;
++      if (rex::filesystem::GetInfo(overlay_dir / name, &info) && info.type == type) {
++        found.push_back(overlay_dir / name);
++      }
++    }
++    return found;
++  };
++
+   auto child_infos = rex::filesystem::ListFiles(parent_entry->host_path());
+   for (auto& child_info : child_infos) {
+-    auto child = HostPathEntry::Create(this, parent_entry,
+-                                       parent_entry->host_path() / child_info.name, child_info);
++    auto host_file = parent_entry->host_path() / child_info.name;
++    auto info = child_info;
++    auto child_overlays = overlays_with(child_info.name, child_info.type);
++    if (child_info.type == Type::kFile && !child_overlays.empty()) {
++      REXFS_INFO("Mods overlay: {} -> {}", rex::path_to_utf8(host_file),
++                 rex::path_to_utf8(child_overlays.front()));
++      host_file = child_overlays.front();
++      rex::filesystem::GetInfo(host_file, &info);
++      info.name = child_info.name;
++    }
++    auto child = HostPathEntry::Create(this, parent_entry, host_file, info);
+     parent_entry->children_.push_back(std::unique_ptr<Entry>(child));
+ 
+-    if (child_info.type == rex::filesystem::FileInfo::Type::kDirectory) {
+-      PopulateEntry(child);
++    if (child_info.type == Type::kDirectory) {
++      PopulateEntry(child, child_overlays);
++    }
++  }
++
++  // Files and folders that exist only in the overlays are added as new entries.
++  std::vector<std::string> added;
++  for (const auto& overlay_dir : overlay_dirs) {
++    for (auto& overlay_info : rex::filesystem::ListFiles(overlay_dir)) {
++      auto name = rex::path_to_utf8(overlay_info.name);
++      auto same_name = [&](const std::string& other) {
++        return rex::string::utf8_equal_case(other, name);
++      };
++      bool in_base = std::any_of(child_infos.begin(), child_infos.end(), [&](const auto& info) {
++        return same_name(rex::path_to_utf8(info.name));
++      });
++      if (in_base || std::any_of(added.begin(), added.end(), same_name)) {
++        continue;
++      }
++      added.push_back(name);
++      auto overlay_file = overlay_dir / overlay_info.name;
++      REXFS_INFO("Mods overlay: added {}", rex::path_to_utf8(overlay_file));
++      auto child = HostPathEntry::Create(this, parent_entry, overlay_file, overlay_info);
++      parent_entry->children_.push_back(std::unique_ptr<Entry>(child));
++      if (overlay_info.type == Type::kDirectory) {
++        // Lower-priority overlays may hold more files for this new folder.
++        auto more = overlays_with(overlay_info.name, Type::kDirectory);
++        more.erase(more.begin());
++        PopulateEntry(child, more);
++      }
+     }
+   }
+ }
+diff --git a/src/filesystem/virtual_file_system.cpp b/src/filesystem/virtual_file_system.cpp
+index a1b4dad..6c09aed 100644
+--- a/src/filesystem/virtual_file_system.cpp
++++ b/src/filesystem/virtual_file_system.cpp
+@@ -234,11 +234,12 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
+       return X_STATUS_FILE_IS_A_DIRECTORY;
+     }
+ 
+-    // If the cached entry does not exist on host anymore, invalidate it.
++    // If the cached entry does not exist on host anymore, invalidate it. Check the entry's
++    // own host path: a mods-overlay file lives in the overlay folder, not under its parent's.
+     if (parent_entry) {
+-      const auto* host_path_entry = dynamic_cast<const HostPathEntry*>(parent_entry);
++      const auto* host_path_entry = dynamic_cast<const HostPathEntry*>(entry);
+       if (host_path_entry) {
+-        const auto file_path = host_path_entry->host_path() / rex::to_path(entry->name());
++        const auto& file_path = host_path_entry->host_path();
+         if (!std::filesystem::exists(file_path)) {
+           entry->Delete();
+           entry = nullptr;
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+index 0d8f8af..5feba79 100644
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -17,9 +17,11 @@ set(REXGPU_XENOS_SOURCES
+ 
+     # GPU system
+     graphics_system.cpp
++    null/graphics_system.cpp
+     command_processor.cpp
+     util/draw_extent_estimator.cpp
+     util/draw.cpp
++    util/draw_trace.cpp
+     packet_disassembler.cpp
+     primitive_processor.cpp
+     pipeline/render_target/cache.cpp
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index a744375..a193287 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -17,6 +17,8 @@
+ 
+ #include <fmt/format.h>
+ 
++#include <thread>
++
+ #include <rex/cvar.h>
+ #include <rex/dbg.h>
+ #include <rex/perf/counter.h>
+@@ -26,6 +28,7 @@
+ #include <rex/graphics/graphics_system.h>
+ #include <rex/graphics/pipeline/texture/info.h>
+ #include <rex/graphics/sampler_info.h>
++#include <rex/graphics/util/draw_trace.h>
+ #include <rex/graphics/xenos.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
+@@ -36,6 +39,59 @@
+ #include <rex/system/user_module.h>
+ 
+ REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
++REXCVAR_DEFINE_BOOL(vsync_wait_precise, false, "GPU",
++                    "Native renderer pacing (SvR07 L13): a WAIT_REG_MEM that waits with vsync on wakes on "
++                    "the guest vblank (an event set right after the vblank interrupt) or a 250 us "
++                    "high-resolution timer, instead of Sleep(1) (which wakes 1-4.5 ms late on a busy "
++                    "desktop). Opt-in; a native renderer build turns it on from its own cvar.");
++
++#if defined(_WIN32)
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN 1
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX 1
++#endif
++#include <windows.h>
++#endif
++
++namespace rex::graphics {
++#if defined(_WIN32)
++namespace {
++// SvR07 L13: one auto-reset event for the CP's vblank-paced WAIT_REG_MEM. MarkVblank sets it after the
++// guest vblank interrupt ran (that interrupt is what releases the game's present wait).
++HANDLE VblankWaitEvent() {
++  static HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++  return ev;
++}
++}  // namespace
++void SignalVblankWaiters() {
++  if (REXCVAR_GET(vsync_wait_precise)) {
++    if (HANDLE ev = VblankWaitEvent())
++      SetEvent(ev);
++  }
++}
++// Returns false if it could not wait (caller falls back to Sleep).
++static bool PreciseVblankPollWait() {
++  HANDLE ev = VblankWaitEvent();
++  thread_local HANDLE timer =
++      CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
++  if (!ev || !timer)
++    return false;
++  LARGE_INTEGER due;
++  due.QuadPart = -2500;  // 250 us, relative, 100 ns units: re-poll for values the CPU (not the vblank) writes
++  if (!SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
++    return false;
++  HANDLE handles[2] = {ev, timer};
++  WaitForMultipleObjects(2, handles, FALSE, INFINITE);
++  CancelWaitableTimer(timer);
++  return true;
++}
++#else
++void SignalVblankWaiters() {}
++static bool PreciseVblankPollWait() { return false; }
++#endif
++}  // namespace rex::graphics
+ 
+ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
+                     "Refresh page-valid state from GPU-written memory at frame end. "
+@@ -74,6 +130,16 @@ REXCVAR_DEFINE_INT32(query_occlusion_fake_sample_count, 1000, "GPU",
+     .range(1, 100000)
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_INT32(gpu_command_delay_us, 0, "GPU",
++                     "Debug: wait this long after new ring buffer commands arrive before "
++                     "executing them, emulating real GPU latency (tests CPU/GPU write races)")
++    .range(0, 100000)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_BOOL(gpu_constant_diag, false, "GPU",
++                    "Debug: log NaN/huge shader constants as they are uploaded (costs CPU)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
+                     "Compile shaders and create pipelines asynchronously in background "
+                     "threads. This reduces stutter but may cause brief visual artifacts while "
+@@ -238,6 +304,11 @@ void CommandProcessor::WorkerThreadMain() {
+     }
+     assert_true(read_ptr_index_ != write_ptr_index);
+ 
++    if (int32_t delay_us = REXCVAR_GET(gpu_command_delay_us); delay_us > 0) {
++      std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
++      write_ptr_index = write_ptr_index_.load();
++    }
++
+     // Execute. Note that we handle wraparound transparently.
+     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
+ 
+@@ -521,6 +592,23 @@ void CommandProcessor::WriteRegisterRangeFromRing(memory::RingBuffer* ring, uint
+ void CommandProcessor::WriteALURangeFromRing(memory::RingBuffer* ring, uint32_t base,
+                                              uint32_t num_registers) {
+   WriteRegisterRangeFromRing(ring, base + 0x4000, num_registers);
++  // Diagnostic: flag absurd shader constants (e.g. corrupted bone matrices).
++  static uint64_t alu_ring_bad_count = 0;
++  for (uint32_t i = 0; REXCVAR_GET(gpu_constant_diag) && i < num_registers && base + i < 0x800;
++       ++i) {
++    uint32_t bits = register_file_->values[0x4000 + base + i];
++    float f;
++    std::memcpy(&f, &bits, sizeof(f));
++    if (!(std::fabs(f) < 1.0e6f)) {
++      ++alu_ring_bad_count;
++      if (alu_ring_bad_count <= 200 || !(alu_ring_bad_count & 1023)) {
++        REXGPU_WARN("SET_CONSTANT: suspicious ALU value {} (0x{:08X}) in c{}.{} (range c{}+{}), "
++                    "total {}",
++                    f, bits, (base + i) / 4, "xyzw"[(base + i) & 3], base / 4, num_registers / 4,
++                    alu_ring_bad_count);
++      }
++    }
++  }
+ }
+ 
+ void CommandProcessor::WriteFetchRangeFromRing(memory::RingBuffer* ring, uint32_t base,
+@@ -959,6 +1047,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
+ 
+   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
++  draw_trace::OnFrame();
+ 
+   ++counter_;
+   return true;
+@@ -1036,7 +1125,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+         if (!REXCVAR_GET(vsync)) {
+           // User wants it fast and dangerous.
+           rex::thread::MaybeYield();
+-        } else {
++        } else if (!(REXCVAR_GET(vsync_wait_precise) && PreciseVblankPollWait())) {
+           rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+         }
+         rex::thread::SyncMemory();
+@@ -1480,6 +1569,28 @@ bool CommandProcessor::ExecutePacketType3_LOAD_ALU_CONSTANT(memory::RingBuffer*
+   size_dwords &= 0xFFF;
+   uint32_t type = (offset_type >> 16) & 0xFF;
+   uint32_t* xlat_address = memory_->TranslatePhysical<uint32_t*>(address);
++  if (type == 0 && REXCVAR_GET(gpu_constant_diag)) {
++    // Diagnostic: constants (e.g. bone matrices) loaded from guest memory.
++    static uint64_t alu_load_count = 0, alu_bad_count = 0;
++    ++alu_load_count;
++    if (alu_load_count <= 20 || !(alu_load_count & 65535)) {
++      REXGPU_INFO("LOAD_ALU_CONSTANT #{}: {:08X} index {} dwords {}", alu_load_count, address,
++                  index, size_dwords);
++    }
++    for (uint32_t i = 0; i < size_dwords; ++i) {
++      uint32_t bits = rex::byte_swap(xlat_address[i]);
++      float f;
++      std::memcpy(&f, &bits, sizeof(f));
++      if (!(std::fabs(f) < 1.0e7f)) {
++        ++alu_bad_count;
++        if (alu_bad_count <= 100) {
++          REXGPU_WARN("LOAD_ALU_CONSTANT: suspicious value {} (0x{:08X}) at {:08X} const {}",
++                      f, bits, address + i * 4, index + i / 4);
++        }
++        break;
++      }
++    }
++  }
+   switch (type) {
+     case 0:  // ALU
+       WriteALURangeFromMem(index, xlat_address, size_dwords);
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 19874a5..8807938 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cstdarg>
+ #include <cstring>
+ #include <sstream>
+@@ -25,6 +26,7 @@
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/registers.h>
+ #include <rex/graphics/util/draw.h>
++#include <rex/graphics/util/draw_trace.h>
+ #include <rex/graphics/xenos.h>
+ #include <rex/kernel/xboxkrnl/video.h>
+ #include <rex/logging.h>
+@@ -1893,6 +1895,19 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
+ 
+ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                       uint32_t frontbuffer_height) {
++  {
++    // Diagnostic: log swap (frame) rate every 5 seconds.
++    static auto fps_t0 = std::chrono::steady_clock::now();
++    static uint32_t fps_frames = 0;
++    ++fps_frames;
++    auto fps_now = std::chrono::steady_clock::now();
++    double fps_dt = std::chrono::duration<double>(fps_now - fps_t0).count();
++    if (fps_dt >= 5.0) {
++      REXGPU_INFO("FPS: {:.1f} ({} swaps in {:.1f}s)", fps_frames / fps_dt, fps_frames, fps_dt);
++      fps_frames = 0;
++      fps_t0 = fps_now;
++    }
++  }
+   SCOPE_profile_cpu_f("gpu");
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
+@@ -2326,6 +2341,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+   }
+   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
+   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
++  draw_trace::NoteDraw(regs, vertex_shader, pixel_shader);
+ 
+   if (!BeginSubmission(true)) {
+     return false;
+@@ -2506,11 +2522,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+                       vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
+           return false;
+       }
++      // Always request the range here: the guest may have rewritten the data at
++      // the same address and size since it was last seen (dynamic and ring
++      // buffers), and RequestRange only uploads pages invalidated by the write
++      // watch anyway. Skipping it on a matching address/size served stale
++      // vertices from a previous frame (one-frame stretched geometry).
+       VertexBufferState& state = vertex_buffer_states_[vfetch_index];
+-      if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
+-        vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
+-        continue;
+-      }
+       if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
+         REXGPU_ERROR(
+             "Failed to request vertex buffer at 0x{:08X} (size {}) in the "
+@@ -2544,6 +2561,19 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+       return false;
+     }
+   }
++  if (memexport_used) {
++    // Diagnostic: does this title write vertex data from shaders?
++    static uint64_t memexport_draw_count = 0;
++    ++memexport_draw_count;
++    if (memexport_draw_count <= 30 || !(memexport_draw_count & 4095)) {
++      REXGPU_INFO("Memexport draw #{} (VS {} PS {}): {} ranges, first {:08X}+{}",
++                  memexport_draw_count, memexport_used_vertex, memexport_used_pixel,
++                  memexport_ranges_.size(),
++                  memexport_ranges_.empty() ? 0u
++                                            : memexport_ranges_[0].base_address_dwords << 2,
++                  memexport_ranges_.empty() ? 0u : memexport_ranges_[0].size_bytes);
++    }
++  }
+   if (memexport_used && memexport_ranges_.empty()) {
+     if (!shared_memory_->RequestRange(0, SharedMemory::kBufferSize)) {
+       REXGPU_ERROR(
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 8f2fcb0..a7c908f 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -17,9 +17,20 @@
+ #include <functional>
+ #include <memory>
+ #include <mutex>
++
++#ifdef _WIN32
++#include <timeapi.h>
++#pragma comment(lib, "winmm.lib")
++#endif
+ #include <utility>
+ 
+ #include <rex/cvar.h>
++#if defined(_WIN32)
++#ifndef NOMINMAX
++#define NOMINMAX 1
++#endif
++#include <windows.h>
++#endif
+ #include <rex/graphics/command_processor.h>
+ #include <rex/graphics/flags.h>
+ #include <rex/kernel/xboxkrnl/video.h>
+@@ -35,6 +46,10 @@ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none,
+     .allowed({"none", "fxaa", "fxaa_extreme"})
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++REXCVAR_DEFINE_BOOL(vsync_precise, false, "GPU",
++                    "Native renderer pacing: fire the guest vblank on a high-resolution timer plus a short "
++                    "spin instead of a 1 ms Sleep poll (frame times 16.7 ms +- 0.1 instead of +- 2-3). "
++                    "Opt-in; a native renderer build turns it on from its own cvar.");
+ REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
+                     "Store shaders persistently and load them when loading games to avoid "
+                     "runtime spikes and freezes when playing the game not for the first time.");
+@@ -60,6 +75,42 @@ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
+ 
+ namespace rex::graphics {
+ 
++// SvR07 L13: command_processor.cpp (vsync_wait_precise); a no-op while that cvar is off.
++void SignalVblankWaiters();
++
++namespace {
++// RR-NR-10: wait until the guest tick count reaches `target`: a high-resolution waitable timer to
++// ~1 ms before, then a spin. The 1 ms Sleep poll fired vblanks 0-3 ms late, so the game's frames
++// (which wait for the vblank) read 13-20 ms around 16.7.
++void PreciseWaitGuestTicks(uint64_t target, uint64_t frequency) {
++  const uint64_t now = chrono::Clock::QueryGuestTickCount();
++  if (now >= target)
++    return;
++  const double remaining_ms = double(target - now) * 1000.0 / double(frequency);
++#if defined(_WIN32)
++  static HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr,
++                                               CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
++                                               TIMER_ALL_ACCESS);
++  if (remaining_ms > 1.5) {
++    LARGE_INTEGER due;
++    due.QuadPart = -static_cast<LONGLONG>((remaining_ms - 1.0) * 10000.0);
++    if (timer && SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0))
++      WaitForSingleObject(timer, INFINITE);
++    else
++      rex::thread::Sleep(std::chrono::milliseconds(1));
++  }
++  while (chrono::Clock::QueryGuestTickCount() < target)
++    YieldProcessor();
++#else
++  if (remaining_ms > 1.5)
++    rex::thread::Sleep(std::chrono::milliseconds(int(remaining_ms - 1.0)));
++  while (chrono::Clock::QueryGuestTickCount() < target) {
++  }
++#endif
++}
++}  // namespace
++
++
+ // Nvidia Optimus/AMD PowerXpress support.
+ // These exports force the process to trigger the discrete GPU in multi-GPU
+ // systems.
+@@ -158,6 +209,10 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
+         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
+         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
++#ifdef _WIN32
++        // 1 ms Sleep granularity so vblanks fire at a true 60 Hz (HollywoodAkeem tweak).
++        timeBeginPeriod(1);
++#endif
+         while (vsync_worker_running_) {
+           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+           uint64_t interval_ticks =
+@@ -166,8 +221,15 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+             MarkVblank();
+             last_frame_time += interval_ticks;
+           }
+-          rex::thread::Sleep(std::chrono::milliseconds(1));
++          if (REXCVAR_GET(vsync_precise) && REXCVAR_GET(vsync)) {
++            PreciseWaitGuestTicks(last_frame_time + interval_ticks, guest_tick_frequency);
++          } else {
++            rex::thread::Sleep(std::chrono::milliseconds(1));
++          }
+         }
++#ifdef _WIN32
++        timeEndPeriod(1);
++#endif
+         return 0;
+       }));
+   // TODO: set_can_debugger_suspend not yet ported
+@@ -329,6 +391,8 @@ void GraphicsSystem::MarkVblank() {
+   //     something wrong and the CP will block waiting for code that
+   //     needs to be run in the interrupt.
+   DispatchInterruptCallback(0, 2);
++  // SvR07 L13 (vsync_wait_precise): wake the CP if it waits for what this vblank interrupt released.
++  SignalVblankWaiters();
+ }
+ 
+ void GraphicsSystem::ClearCaches() {
+diff --git a/src/graphics/plugin_main.cpp b/src/graphics/plugin_main.cpp
+index ec756d3..86ce585 100644
+--- a/src/graphics/plugin_main.cpp
++++ b/src/graphics/plugin_main.cpp
+@@ -14,6 +14,7 @@
+ #include <rex/logging.h>
+ #include <rex/system/gpu_plugin.h>
+ 
++#include <rex/graphics/null/graphics_system.h>
+ #if REX_HAS_D3D12
+ #include <rex/graphics/d3d12/graphics_system.h>
+ #endif
+@@ -38,6 +39,10 @@ extern "C" REX_GPU_PLUGIN_EXPORT rex::system::IGraphicsSystem* rex_gpu_create(
+   }
+ 
+   std::string_view backend = info->backend ? info->backend : "any";
++  // Synchronization-only guest GPU for apps with their own renderer (never picked by "any").
++  if (backend == "null") {
++    return new rex::graphics::null_gpu::NullGraphicsSystem();
++  }
+ #if REX_HAS_D3D12
+   if (backend == "any" || backend == "d3d12") {
+     return new rex::graphics::d3d12::D3D12GraphicsSystem();
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index ec0df7c..e3141a2 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -10,16 +10,24 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cstring>
+ #include <utility>
+ 
+ #include <rex/assert.h>
+ #include <rex/bit.h>
+ #include <rex/dbg.h>
++#include <rex/cvar.h>
+ #include <rex/graphics/shared_memory.h>
++#include <rex/hash.h>
++#include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/memory.h>
+ 
++REXCVAR_DEFINE_BOOL(gpu_verify_shared_memory, false, "GPU",
++                    "Debug: hash CPU-uploaded pages and log when guest memory changes without "
++                    "the write watch invalidating them (stale vertex/texture data). Slow.");
++
+ namespace rex::graphics {
+ 
+ SharedMemory::SharedMemory(memory::Memory& memory) : memory_(memory) {
+@@ -403,8 +411,17 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+     }
+     upload_ranges_.emplace_back(page_start, page_count);
+   };
++  bool verify = REXCVAR_GET(gpu_verify_shared_memory);
+   {
+     auto global_lock = global_critical_region_.Acquire();
++    if (verify) {
++      static bool logged = false;
++      if (!logged) {
++        logged = true;
++        REXGPU_INFO("Shared memory: gpu_verify_shared_memory active");
++      }
++      VerifyValidPages(merged_ranges);
++    }
+     for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
+       uint32_t page_first = range.first >> page_size_log2_;
+       uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
+@@ -465,7 +482,63 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+     return true;
+   }
+ 
+-  return UploadRanges(upload_ranges_);
++  if (!UploadRanges(upload_ranges_)) {
++    return false;
++  }
++  if (verify) {
++    auto global_lock = global_critical_region_.Acquire();
++    if (debug_page_hashes_.size() != (kBufferSize >> page_size_log2_)) {
++      debug_page_hashes_.assign(kBufferSize >> page_size_log2_, 0);
++    }
++    if (debug_page_upload_time_.size() != (kBufferSize >> page_size_log2_)) {
++      debug_page_upload_time_.assign(kBufferSize >> page_size_log2_, 0);
++    }
++    int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
++    for (const std::pair<uint32_t, uint32_t>& range : upload_ranges_) {
++      for (uint32_t page = range.first; page < range.first + range.second; ++page) {
++        debug_page_upload_time_[page] = now;
++        debug_page_hashes_[page] = XXH3_64bits(
++            memory().TranslatePhysical(page << page_size_log2_), size_t(1) << page_size_log2_);
++      }
++    }
++  }
++  return true;
++}
++
++void SharedMemory::VerifyValidPages(
++    const std::vector<std::pair<uint32_t, uint32_t>>& ranges) {
++  // Called with the global critical region held. A CPU-uploaded page that is
++  // still valid must not have changed in guest memory: a write would have hit
++  // the write watch and invalidated it first.
++  if (debug_page_hashes_.size() != (kBufferSize >> page_size_log2_)) {
++    return;
++  }
++  for (const std::pair<uint32_t, uint32_t>& range : ranges) {
++    uint32_t page_first = range.first >> page_size_log2_;
++    uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
++    for (uint32_t page = page_first; page <= page_last; ++page) {
++      uint64_t bit = uint64_t(1) << (page & 63);
++      if (!(system_page_flags_valid_[page >> 6] & bit) ||
++          (system_page_flags_valid_and_gpu_written_[page >> 6] & bit)) {
++        continue;
++      }
++      uint64_t& stored = debug_page_hashes_[page];
++      if (!stored) {
++        continue;
++      }
++      uint64_t current = XXH3_64bits(memory().TranslatePhysical(page << page_size_log2_),
++                                     size_t(1) << page_size_log2_);
++      if (current != stored) {
++        ++debug_stale_page_count_;
++        if (debug_stale_page_count_ <= 200 || !(debug_stale_page_count_ & 1023)) {
++          REXGPU_WARN("Shared memory: stale page {:08X} (guest changed it without "
++                      "invalidation), total {}",
++                      page << page_size_log2_, debug_stale_page_count_);
++        }
++        stored = current;
++      }
++    }
++  }
+ }
+ 
+ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
+@@ -494,6 +567,23 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
+ 
+   auto global_lock = global_critical_region_.Acquire();
+ 
++  if (!debug_page_upload_time_.empty()) {
++    // A guest write very soon after the GPU copied the page suggests the guest
++    // was still filling it when the draw was processed (half-written data).
++    int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
++    for (uint32_t page = page_first; page <= page_last; ++page) {
++      int64_t uploaded = debug_page_upload_time_[page];
++      if (uploaded && now - uploaded < 2000000) {
++        ++debug_late_write_count_;
++        if (debug_late_write_count_ <= 300 || !(debug_late_write_count_ & 1023)) {
++          REXGPU_WARN("Shared memory: guest wrote page {:08X} {} us after GPU upload, total {}",
++                      page << page_size_log2_, (now - uploaded) / 1000, debug_late_write_count_);
++        }
++      }
++      debug_page_upload_time_[page] = 0;
++    }
++  }
++
+   if (!exact_range) {
+     // Check if a somewhat wider range (up to 256 KB with 4 KB pages) can be
+     // invalidated - if no GPU-written data nearby that was not intended to be
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 001f36b..2260fae 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <array>
+ #include <cstdint>
+ #include <cstring>
+@@ -29,6 +30,7 @@
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/graphics/util/draw.h>
++#include <rex/graphics/util/draw_trace.h>
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/pipeline/shader/shader.h>
+ #include <rex/graphics/pipeline/shader/spirv_translator.h>
+@@ -2271,6 +2273,19 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
+ 
+ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                        uint32_t frontbuffer_height) {
++  {
++    // Diagnostic: log guest swap (frame) rate every 5 seconds.
++    static auto fps_t0 = std::chrono::steady_clock::now();
++    static uint32_t fps_frames = 0;
++    ++fps_frames;
++    auto fps_now = std::chrono::steady_clock::now();
++    double fps_dt = std::chrono::duration<double>(fps_now - fps_t0).count();
++    if (fps_dt >= 5.0) {
++      REXGPU_INFO("FPS: {:.1f} ({} swaps in {:.1f}s)", fps_frames / fps_dt, fps_frames, fps_dt);
++      fps_frames = 0;
++      fps_t0 = fps_now;
++    }
++  }
+   SCOPE_profile_cpu_f("gpu");
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
+@@ -3679,6 +3694,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     }
+     draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
+   }
++  draw_trace::NoteDraw(regs, vertex_shader, pixel_shader);
+   reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
+ 
+   uint32_t ps_param_gen_pos = UINT32_MAX;
+@@ -4009,11 +4025,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+                       vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
+           return false;
+       }
++      // Always request: the guest may have rewritten the same address/size
++      // (see the D3D12 command processor).
+       VertexBufferState& state = vertex_buffer_states_[vfetch_index];
+-      if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
+-        vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
+-        continue;
+-      }
+       if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
+         REXGPU_ERROR(
+             "Failed to request vertex buffer at 0x{:08X} (size {}) in the shared "
+diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
+index 813bb1c..2a38cfd 100644
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -10,7 +10,15 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cmath>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <mutex>
++#include <sstream>
++#include <string>
+ 
+ #include <rex/dbg.h>
+ #include <rex/input/device_assignment.h>
+@@ -28,6 +36,11 @@ REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput
+     .allowed({"sdl", "xinput"});
+ 
+ REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
++
++REXCVAR_DEFINE_STRING(input_script, "", "Input",
++                      "Virtual pads for unattended self-tests: a text file of timed pad events.\n"
++                      "Each pad it names (0-3) is connected and driven only by the script, also\n"
++                      "while the window is unfocused. Empty = off");
+ namespace rex::input {
+ 
+ namespace {
+@@ -37,6 +50,284 @@ namespace {
+ // flag and never reads this value.
+ constexpr uint32_t kSyntheticOrdinal = UINT32_MAX;
+ 
++// Input script (cvar input_script). One event per line, '#' starts a comment:
++//   pad <n>                                    connect pad n (idle unless events drive it)
++//   <t> <pad> <hold> [BUTTON...] [lx=f] [ly=f] [rx=f] [ry=f] [lt=f] [rt=f]
++// t = seconds since the first pad poll ("+s" = after the previous event's t), hold = seconds held,
++// sticks -1..1, triggers 0..1. Buttons: A B X Y START BACK LB RB LS RS UP DOWN LEFT RIGHT.
++// Events overlapping in time OR their buttons; the last one sets the sticks.
++// The file is re-read when it changes (checked every 0.25 s): the new events replace the old ones and
++// their t counts from the reload, pads stay connected. Self-tests use this to press after a screen shows.
++// A line 'sync' makes each pad's events run one after another, every press seen by >= 3 polls with >= 3
++// released polls between presses (a slow or uneven frame rate cannot drop a press); combos go on one line.
++struct ScriptEvent {
++  double t = 0.0;
++  double hold = 0.0;
++  uint32_t pad = 0;
++  uint16_t buttons = 0;
++  double lx = 0.0, ly = 0.0, rx = 0.0, ry = 0.0, lt = 0.0, rt = 0.0;
++  bool logged = false;
++  double start = -1.0;  // sync: when it became active
++  uint32_t polls = 0;   // sync: polls that saw it
++  bool done = false;    // sync
++};
++
++constexpr uint32_t kSyncPolls = 3;
++
++struct InputScript {
++  std::mutex mutex;
++  bool loaded = false;
++  bool sync = false;
++  bool pads[4] = {};
++  uint32_t idle_polls[4] = {};
++  double released[4] = {-1.0, -1.0, -1.0, -1.0};  // sync: when the last press ended (since t0)
++  std::vector<ScriptEvent> events;
++  std::chrono::steady_clock::time_point t0;
++  std::chrono::steady_clock::time_point next_check;
++  std::filesystem::file_time_type file_time;
++  uint32_t packet = 0;
++  uint16_t key_buttons[4] = {};  // buttons already reported as keystrokes
++};
++
++InputScript& Script() {
++  static InputScript script;
++  return script;
++}
++
++uint16_t ScriptButton(const std::string& name) {
++  static const std::pair<const char*, uint16_t> kButtons[] = {
++      {"A", X_INPUT_GAMEPAD_A},
++      {"B", X_INPUT_GAMEPAD_B},
++      {"X", X_INPUT_GAMEPAD_X},
++      {"Y", X_INPUT_GAMEPAD_Y},
++      {"START", X_INPUT_GAMEPAD_START},
++      {"BACK", X_INPUT_GAMEPAD_BACK},
++      {"LB", X_INPUT_GAMEPAD_LEFT_SHOULDER},
++      {"RB", X_INPUT_GAMEPAD_RIGHT_SHOULDER},
++      {"LS", X_INPUT_GAMEPAD_LEFT_THUMB},
++      {"RS", X_INPUT_GAMEPAD_RIGHT_THUMB},
++      {"UP", X_INPUT_GAMEPAD_DPAD_UP},
++      {"DOWN", X_INPUT_GAMEPAD_DPAD_DOWN},
++      {"LEFT", X_INPUT_GAMEPAD_DPAD_LEFT},
++      {"RIGHT", X_INPUT_GAMEPAD_DPAD_RIGHT},
++  };
++  for (const auto& [n, bit] : kButtons) {
++    if (name == n) {
++      return bit;
++    }
++  }
++  return 0;
++}
++
++// Caller holds the mutex.
++void LoadScript(InputScript& script) {
++  script.loaded = true;
++  script.t0 = std::chrono::steady_clock::now();
++  script.next_check = script.t0 + std::chrono::milliseconds(250);
++  script.events.clear();
++  script.sync = false;
++  std::fill(std::begin(script.released), std::end(script.released), -1.0);  // t0 moved
++  const std::string path = REXCVAR_GET(input_script);
++  if (path.empty()) {
++    return;
++  }
++  std::error_code ec;
++  script.file_time = std::filesystem::last_write_time(path, ec);
++  std::ifstream in(path);
++  if (!in) {
++    REXLOG_ERROR("input_script: cannot open {}", path);
++    return;
++  }
++  std::string line;
++  double prev_t = 0.0;
++  while (std::getline(in, line)) {
++    line = line.substr(0, line.find('#'));
++    std::istringstream words(line);
++    std::string first;
++    if (!(words >> first)) {
++      continue;
++    }
++    if (first == "sync") {
++      script.sync = true;
++      continue;
++    }
++    if (first == "pad") {
++      uint32_t n = 0;
++      if (words >> n && n < 4) {
++        script.pads[n] = true;
++      }
++      continue;
++    }
++    ScriptEvent ev;
++    ev.t = first[0] == '+' ? prev_t + std::atof(first.c_str() + 1) : std::atof(first.c_str());
++    if (!(words >> ev.pad >> ev.hold) || ev.pad >= 4) {
++      REXLOG_ERROR("input_script: bad line '{}'", line);
++      continue;
++    }
++    prev_t = ev.t;
++    std::string word;
++    while (words >> word) {
++      const auto eq = word.find('=');
++      if (eq == std::string::npos) {
++        std::transform(word.begin(), word.end(), word.begin(),
++                       [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
++        const uint16_t bit = ScriptButton(word);
++        if (!bit) {
++          REXLOG_ERROR("input_script: unknown button '{}'", word);
++        }
++        ev.buttons |= bit;
++        continue;
++      }
++      const std::string key = word.substr(0, eq);
++      const double v = std::clamp(std::atof(word.c_str() + eq + 1), -1.0, 1.0);
++      if (key == "lx") {
++        ev.lx = v;
++      } else if (key == "ly") {
++        ev.ly = v;
++      } else if (key == "rx") {
++        ev.rx = v;
++      } else if (key == "ry") {
++        ev.ry = v;
++      } else if (key == "lt") {
++        ev.lt = v;
++      } else if (key == "rt") {
++        ev.rt = v;
++      }
++    }
++    script.pads[ev.pad] = true;
++    script.events.push_back(ev);
++  }
++  REXLOG_INFO("input_script: {} events from {}", script.events.size(), path);
++}
++
++bool ScriptOwnsPad(uint32_t user_index) {
++  auto& script = Script();
++  std::lock_guard lock(script.mutex);
++  if (!script.loaded) {
++    LoadScript(script);
++  } else if (const auto now = std::chrono::steady_clock::now(); now >= script.next_check) {
++    script.next_check = now + std::chrono::milliseconds(250);
++    const std::string path = REXCVAR_GET(input_script);
++    std::error_code ec;
++    const auto time = path.empty() ? script.file_time : std::filesystem::last_write_time(path, ec);
++    if (!ec && time != script.file_time) {
++      REXLOG_INFO("input_script: file changed, reloading");
++      LoadScript(script);
++    }
++  }
++  return user_index < 4 && script.pads[user_index];
++}
++
++bool ScriptState(uint32_t user_index, X_INPUT_STATE* out_state) {
++  if (!ScriptOwnsPad(user_index)) {
++    return false;
++  }
++  auto& script = Script();
++  std::lock_guard lock(script.mutex);
++  const double now =
++      std::chrono::duration<double>(std::chrono::steady_clock::now() - script.t0).count();
++  auto stick = [](double v) { return static_cast<int16_t>(std::lround(v * 32767.0)); };
++  auto trigger = [](double v) { return static_cast<uint8_t>(std::lround(std::abs(v) * 255.0)); };
++  X_INPUT_STATE state = {};
++  uint16_t buttons = 0;
++  // sync: only the pad's first unfinished event can be active; it starts at its t once the pad has been
++  // polled released kSyncPolls times, and ends once both its hold ran out and it was polled kSyncPolls times.
++  ScriptEvent* sync_ev = nullptr;
++  if (script.sync) {
++    for (auto& ev : script.events) {
++      if (ev.pad == user_index && !ev.done) {
++        sync_ev = &ev;
++        break;
++      }
++    }
++    if (sync_ev && sync_ev->start < 0.0 && now >= sync_ev->t && script.idle_polls[user_index] >= kSyncPolls &&
++        now - script.released[user_index] >= 0.2) {
++      sync_ev->start = now;
++    }
++    if (!sync_ev || sync_ev->start < 0.0) {
++      sync_ev = nullptr;
++      ++script.idle_polls[user_index];
++    }
++  }
++  for (auto& ev : script.events) {
++    if (script.sync ? &ev != sync_ev
++                    : ev.pad != user_index || now < ev.t || now >= ev.t + ev.hold) {
++      continue;
++    }
++    if (script.sync && ++ev.polls >= kSyncPolls && now - ev.start >= ev.hold) {
++      ev.done = true;
++      script.idle_polls[user_index] = 0;
++      script.released[user_index] = now;
++    }
++    if (!ev.logged) {
++      ev.logged = true;
++      REXLOG_INFO("input_script: t {:.2f} pad {} buttons {:04X} lx {} ly {}", script.sync ? ev.start : ev.t,
++                  ev.pad, ev.buttons, ev.lx, ev.ly);
++    }
++    buttons |= ev.buttons;
++    if (ev.lx != 0.0 || ev.ly != 0.0) {
++      state.gamepad.thumb_lx = stick(ev.lx);
++      state.gamepad.thumb_ly = stick(ev.ly);
++    }
++    if (ev.rx != 0.0 || ev.ry != 0.0) {
++      state.gamepad.thumb_rx = stick(ev.rx);
++      state.gamepad.thumb_ry = stick(ev.ry);
++    }
++    if (ev.lt != 0.0) {
++      state.gamepad.left_trigger = trigger(ev.lt);
++    }
++    if (ev.rt != 0.0) {
++      state.gamepad.right_trigger = trigger(ev.rt);
++    }
++  }
++  state.gamepad.buttons = buttons;
++  state.packet_number = ++script.packet;
++  if (out_state) {
++    *out_state = state;
++  }
++  return true;
++}
++
++// Keystroke events for scripted pads (menus that read XInputGetKeystroke): one down/up edge per call.
++X_RESULT ScriptKeystroke(uint32_t user_index, X_INPUT_KEYSTROKE* out) {
++  static const std::pair<uint16_t, uint16_t> kKeys[] = {
++      {X_INPUT_GAMEPAD_A, 0x5800},          {X_INPUT_GAMEPAD_B, 0x5801},
++      {X_INPUT_GAMEPAD_X, 0x5802},          {X_INPUT_GAMEPAD_Y, 0x5803},
++      {X_INPUT_GAMEPAD_RIGHT_SHOULDER, 0x5804}, {X_INPUT_GAMEPAD_LEFT_SHOULDER, 0x5805},
++      {X_INPUT_GAMEPAD_DPAD_UP, 0x5810},    {X_INPUT_GAMEPAD_DPAD_DOWN, 0x5811},
++      {X_INPUT_GAMEPAD_DPAD_LEFT, 0x5812},  {X_INPUT_GAMEPAD_DPAD_RIGHT, 0x5813},
++      {X_INPUT_GAMEPAD_START, 0x5814},      {X_INPUT_GAMEPAD_BACK, 0x5815},
++      {X_INPUT_GAMEPAD_LEFT_THUMB, 0x5816}, {X_INPUT_GAMEPAD_RIGHT_THUMB, 0x5817},
++  };
++  bool owned = false;
++  for (uint32_t pad = 0; pad < 4; ++pad) {
++    if ((user_index != 0xFF && pad != user_index) || !ScriptOwnsPad(pad)) {
++      continue;
++    }
++    owned = true;
++    X_INPUT_STATE state = {};
++    ScriptState(pad, &state);
++    auto& script = Script();
++    std::lock_guard lock(script.mutex);
++    const uint16_t now = state.gamepad.buttons;
++    for (const auto& [bit, vk] : kKeys) {
++      const bool down = now & bit, was = script.key_buttons[pad] & bit;
++      if (down == was) {
++        continue;
++      }
++      script.key_buttons[pad] ^= bit;
++      if (out) {
++        std::memset(out, 0, sizeof(*out));
++        out->virtual_key = vk;
++        out->flags = down ? 0x1 : 0x2;  // XINPUT_KEYSTROKE_KEYDOWN / KEYUP
++        out->user_index = static_cast<uint8_t>(pad);
++      }
++      return X_ERROR_SUCCESS;
++    }
++  }
++  return owned ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
++}
++
+ }  // namespace
+ 
+ InputSystem::InputSystem(rex::ui::Window* window) : window_(window) {}
+@@ -66,8 +357,13 @@ void InputSystem::AttachWindow(rex::ui::Window* window) {
+ }
+ 
+ void InputSystem::SetActiveCallback(std::function<bool()> callback) {
++  // SVR07: only the keyboard/mouse driver goes inactive while an overlay is open
++  // (releases the cursor). Real pads stay live so the pad hook can drive the F4
++  // menu; the hook hides them from the game instead.
+   for (auto& driver : drivers_) {
+-    driver->set_is_active_callback(callback);
++    if (dynamic_cast<mnk::MnkInputDriver*>(driver.get())) {
++      driver->set_is_active_callback(callback);
++    }
+   }
+ }
+ 
+@@ -187,6 +483,20 @@ const DeviceInfo* InputSystem::DeviceInfoFor(DeviceId id) const {
+ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+                                       X_INPUT_CAPABILITIES* out_caps) {
+   SCOPE_profile_cpu_f("hid");
++  if (out_caps && ScriptOwnsPad(user_index)) {
++    // A scripted pad reports a standard gamepad, like the NOP driver.
++    std::memset(out_caps, 0, sizeof(*out_caps));
++    out_caps->type = 0x01;
++    out_caps->sub_type = 0x01;
++    out_caps->gamepad.buttons = 0xFFFF;
++    out_caps->gamepad.left_trigger = 0xFF;
++    out_caps->gamepad.right_trigger = 0xFF;
++    out_caps->gamepad.thumb_lx = static_cast<int16_t>(0x7FFF);
++    out_caps->gamepad.thumb_ly = static_cast<int16_t>(0x7FFF);
++    out_caps->gamepad.thumb_rx = static_cast<int16_t>(0x7FFF);
++    out_caps->gamepad.thumb_ry = static_cast<int16_t>(0x7FFF);
++    return X_ERROR_SUCCESS;
++  }
+   if (!out_caps || !assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+@@ -212,8 +522,15 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+   return driver->GetDeviceCapabilities(chosen, flags, out_caps);
+ }
+ 
++void InputSystem::SetPadHook(std::function<bool(const X_INPUT_GAMEPAD&)> hook) {
++  pad_hook_ = std::move(hook);
++}
++
+ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+   SCOPE_profile_cpu_f("hid");
++  if (ScriptState(user_index, out_state)) {
++    return X_ERROR_SUCCESS;
++  }
+   if (!assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+@@ -245,6 +562,12 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+   if (!any) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
++  if (user_index == 0 && pad_hook_ && pad_hook_(merged.gamepad)) {
++    merged.gamepad = {};
++  }
++  if (g_input_blocked.load(std::memory_order_relaxed)) {
++    merged.gamepad = {};
++  }
+   if (out_state) {
+     *out_state = merged;
+   }
+@@ -295,6 +618,9 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
+ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
+                                    X_INPUT_KEYSTROKE* out_keystroke) {
+   SCOPE_profile_cpu_f("hid");
++  if (X_RESULT r = ScriptKeystroke(user_index, out_keystroke); r != X_ERROR_DEVICE_NOT_CONNECTED) {
++    return r;
++  }
+   if (!assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
+index 3f9422d..02e4bd9 100644
+--- a/src/input/mnk/mnk_input_driver.cpp
++++ b/src/input/mnk/mnk_input_driver.cpp
+@@ -27,6 +27,8 @@ REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller
+ REXCVAR_DEFINE_BOOL(mnk_mouse, false, "Input",
+                     "Use the mouse for the right stick. Off means the right stick comes "
+                     "from the keybind_rstick_* keys only");
++REXCVAR_DEFINE_BOOL(mnk_ignore_focus, false, "Input",
++                    "Accept keyboard input while the window is unfocused (for scripted testing)");
+ REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse sensitivity for right stick")
+     .range(0.01, 10.0);
+ 
+@@ -264,7 +266,7 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
+   QueueMouseCaptureUpdate(IsEnabled() && REXCVAR_GET(mnk_mouse) && IsMouseLookActive() &&
+                           has_focus_ && is_active());
+ 
+-  if (!is_active() || !has_focus_) {
++  if (!is_active() || !(has_focus_ || REXCVAR_GET(mnk_ignore_focus))) {
+     if (out_state) {
+       std::memset(out_state, 0, sizeof(*out_state));
+       out_state->packet_number = packet_number_;
+@@ -481,7 +483,7 @@ void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
+ }
+ 
+ void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
+-  if (!IsEnabled() || !has_focus_)
++  if (!IsEnabled() || !(has_focus_ || REXCVAR_GET(mnk_ignore_focus)))
+     return;
+   std::lock_guard lock(state_mutex_);
+   uint16_t vk = static_cast<uint16_t>(e.virtual_key());
+@@ -497,7 +499,7 @@ void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
+ }
+ 
+ void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
+-  if (!IsEnabled() || !has_focus_)
++  if (!IsEnabled() || !(has_focus_ || REXCVAR_GET(mnk_ignore_focus)))
+     return;
+   std::lock_guard lock(state_mutex_);
+   switch (e.button()) {
+@@ -535,7 +537,7 @@ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
+ }
+ 
+ void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
+-  if (!IsEnabled() || !has_focus_)
++  if (!IsEnabled() || !(has_focus_ || REXCVAR_GET(mnk_ignore_focus)))
+     return;
+   int32_t x = e.x();
+   int32_t y = e.y();
+diff --git a/src/kernel/xam/xam_content.cpp b/src/kernel/xam/xam_content.cpp
+index 1fb1e16..ed65e3e 100644
+--- a/src/kernel/xam/xam_content.cpp
++++ b/src/kernel/xam/xam_content.cpp
+@@ -107,7 +107,8 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
+     // TODO(gibbed): disc drive content
+   }
+ 
+-  REXKRNL_DEBUG("XamContentCreateEnumerator: added {} items to enumerator", e->item_count());
++  REXKRNL_INFO("XamContentCreateEnumerator: device={} type={:08X} -> {} items",
++               uint32_t(device_id), uint32_t(content_type), e->item_count());
+ 
+   *handle_out = e->handle();
+   return X_ERROR_SUCCESS;
+@@ -224,6 +225,12 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
+       *disposition_ptr = static_cast<uint32_t>(disposition);
+     }
+ 
++    REXKRNL_INFO("XamContentCreate: root='{}' file='{}' device={} type={:08X} flags={:X} -> "
++                 "disposition={} result={:08X}",
++                 root_name, content_data.file_name(), uint32_t(content_data.device_id),
++                 uint32_t(XContentType(content_data.content_type)), uint32_t(flags), uint32_t(disposition),
++                 result);
++
+     extended_error = X_HRESULT_FROM_WIN32(result);
+     length = static_cast<uint32_t>(disposition);
+     return result;
+@@ -281,6 +288,7 @@ u32 XamContentFlush_entry(mapped_string root_name, mapped_void overlapped_ptr) {
+ u32 XamContentClose_entry(mapped_string root_name, mapped_void overlapped_ptr) {
+   // Closes a previously opened root from XamContentCreate*.
+   auto result = REX_KERNEL_STATE()->content_manager()->CloseContent(root_name.value());
++  REXKRNL_INFO("XamContentClose: root='{}' -> {:08X}", root_name.value(), result);
+ 
+   if (overlapped_ptr) {
+     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
+@@ -316,6 +324,8 @@ u32 XamContentGetCreator_entry(u32 user_index, mapped_void content_data_ptr,
+   } else {
+     result = X_ERROR_PATH_NOT_FOUND;
+   }
++  REXKRNL_INFO("XamContentGetCreator: file='{}' device={} -> {:08X}", content_data.file_name(),
++               uint32_t(content_data.device_id), result);
+ 
+   if (overlapped_ptr) {
+     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp b/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp
+index bd5de65..f1aee1a 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp
+@@ -267,7 +267,14 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
+         basic_result &= file->entry()->SetWriteTimestamp(info->last_write_time);
+       }
+ 
+-      basic_result &= file->entry()->SetAttributes(info->attributes);
++      // NT semantics: FileAttributes == 0 means "leave unchanged", and the
++      // directory bit cannot be changed through FileBasicInformation.
++      uint32_t attributes = info->attributes;
++      if (attributes) {
++        uint32_t directory_bit = file->entry()->attributes() & X_FILE_ATTRIBUTE_DIRECTORY;
++        attributes = (attributes & ~uint32_t(X_FILE_ATTRIBUTE_DIRECTORY)) | directory_bit;
++        basic_result &= file->entry()->SetAttributes(attributes);
++      }
+       if (!basic_result) {
+         result = X_STATUS_UNSUCCESSFUL;
+       }
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_memory.cpp b/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
+index 8684eda..aada96a 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
+@@ -203,7 +203,11 @@ u32 NtAllocateVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_si
+ u32 NtProtectVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_size_ptr,
+                                  u32 protect_bits, mapped_u32 old_protect, u32 debug_memory) {
+   // Set to TRUE when this memory refers to devkit memory area.
+-  assert_true(debug_memory == 0);
++  // (HollywoodAkeem tweak) devkit-memory flag is ignored instead of asserting.
++  if ((uint32_t)debug_memory != 0) {
++    REXKRNL_WARN("debug_memory {} ignored", (uint32_t)debug_memory);
++    debug_memory = 0;
++  }
+ 
+   // Must request a size.
+   if (!base_addr_ptr || !region_size_ptr || !*region_size_ptr) {
+@@ -261,7 +265,11 @@ u32 NtFreeVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_size_p
+   // _In_     BOOLEAN DebugMemory
+ 
+   // Set to TRUE when freeing external devkit memory.
+-  assert_true(debug_memory == 0);
++  // (HollywoodAkeem tweak) devkit-memory flag is ignored instead of asserting.
++  if ((uint32_t)debug_memory != 0) {
++    REXKRNL_WARN("debug_memory {} ignored", (uint32_t)debug_memory);
++    debug_memory = 0;
++  }
+ 
+   if (!base_addr_value) {
+     return X_STATUS_MEMORY_NOT_ALLOCATED;
+@@ -571,13 +579,15 @@ u32 MmGetPhysicalAddress_entry(u32 base_address) {
+ 
+ u32 MmMapIoSpace_entry(u32 unk0, mapped_void src_address, u32 size, u32 flags) {
+   // I've only seen this used to map XMA audio contexts.
+-  // The code seems fine with taking the src address, so this just returns that.
+-  // If others start using it there could be problems.
++  // src_address is a physical address; return the matching vE0000000 virtual address so the
++  // caller reads the real XMA context (HollywoodAkeem tweak):
++  //   phys = (virt - 0xE0000000) + 0x1000
+   assert_true(unk0 == 2);
+   assert_true(size == 0x40);
+   assert_true(flags == 0x404);
+ 
+-  return src_address.guest_address();
++  uint32_t physical_address = src_address.guest_address();
++  return physical_address - 0x1000 + 0xE0000000;
+ }
+ 
+ struct X_POOL_ALLOC_HEADER {
+diff --git a/src/system/function_dispatcher.cpp b/src/system/function_dispatcher.cpp
+index bd43109..ee0ae31 100644
+--- a/src/system/function_dispatcher.cpp
++++ b/src/system/function_dispatcher.cpp
+@@ -139,6 +139,19 @@ uint64_t FunctionDispatcher::ExecuteTrap(ThreadState* thread_state, uint32_t add
+   return result;
+ }
+ 
++namespace {
++thread_local uint32_t interrupt_depth_ = 0;
++
++struct InterruptScope {
++  InterruptScope() { ++interrupt_depth_; }
++  ~InterruptScope() { --interrupt_depth_; }
++};
++}  // namespace
++
++bool FunctionDispatcher::IsInInterrupt() {
++  return interrupt_depth_ != 0;
++}
++
+ uint64_t FunctionDispatcher::ExecuteInterrupt(ThreadState* thread_state, uint32_t address,
+                                               uint64_t args[], size_t arg_count) {
+   SCOPE_profile_cpu_f("cpu");
+@@ -146,6 +159,7 @@ uint64_t FunctionDispatcher::ExecuteInterrupt(ThreadState* thread_state, uint32_
+ 
+   // Hold the global lock during interrupt dispatch.
+   auto global_lock = global_critical_region_.Acquire();
++  InterruptScope interrupt_scope;
+ 
+   auto* ctx = thread_state->context();
+   assert_true(arg_count <= 5);
+diff --git a/src/system/kernel_state.cpp b/src/system/kernel_state.cpp
+index 697399c..0afdb1e 100644
+--- a/src/system/kernel_state.cpp
++++ b/src/system/kernel_state.cpp
+@@ -1220,6 +1220,15 @@ void KernelState::CompleteOverlappedDeferredEx(
+   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
+   XOverlappedSetResult(ptr, X_ERROR_IO_PENDING);
+   XOverlappedSetContext(ptr, XThread::GetCurrentThreadHandle());
++  // Starting an async operation unsignals its event, as overlapped I/O does on
++  // Windows. Titles that reuse one XOVERLAPPED would otherwise see the event
++  // still set by the previous operation and read a result that is still
++  // pending (SvR2007 reports its storage device as removed).
++  if (X_HANDLE event_handle = XOverlappedGetEvent(ptr)) {
++    if (auto ev = object_table()->LookupObject<XEvent>(event_handle)) {
++      ev->Reset();
++    }
++  }
+   auto global_lock = global_critical_region_.Acquire();
+   dispatch_queue_.push_back(
+       [this, completion_callback, overlapped_ptr, pre_callback, post_callback]() {
+diff --git a/src/system/runtime.cpp b/src/system/runtime.cpp
+index c10694c..03eb40c 100644
+--- a/src/system/runtime.cpp
++++ b/src/system/runtime.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <rex/chrono/clock.h>
+ #include <rex/cvar.h>
++#include <rex/filesystem.h>
+ #include <rex/filesystem/devices/host_path_device.h>
+ #include <rex/filesystem/devices/null_device.h>
+ #include <rex/filesystem/vfs.h>
+@@ -33,11 +34,38 @@ REXCVAR_DEFINE_STRING(user_data_root, "", "Runtime", "Override user data path");
+ REXCVAR_DEFINE_STRING(update_data_root, "", "Runtime", "Override update data path");
+ REXCVAR_DEFINE_STRING(cache_root, "", "Runtime", "Override shader cache path");
+ REXCVAR_DEFINE_STRING(metadata_root, "", "Runtime", "Override metadata path");
++REXCVAR_DEFINE_STRING(mods_root, "", "Runtime",
++                      "Loose-file mods folder; files here replace same-named game files "
++                      "(default: mods next to the exe)");
++REXCVAR_DEFINE_BOOL(mods_enabled, true, "Runtime", "Load files from the mods folder")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++REXCVAR_DEFINE_BOOL(mount_cache_partition, true, "Runtime",
++                    "Give the game the 360's HDD cache partition (cache:), as Xenia does")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+ namespace rex {
+ 
+ // Static instance for global access
+ Runtime* Runtime::instance_ = nullptr;
++std::vector<std::filesystem::path> Runtime::extra_mods_overlays_;
++
++std::filesystem::path Runtime::ResolveModsRoot() {
++  if (!REXCVAR_GET(mods_enabled)) {
++    return {};
++  }
++  std::filesystem::path mods_dir = REXCVAR_GET(mods_root).empty()
++                                       ? rex::filesystem::GetExecutableFolder() / "mods"
++                                       : rex::to_path(REXCVAR_GET(mods_root));
++  std::error_code ec;
++  if (!std::filesystem::is_directory(mods_dir, ec)) {
++    return {};
++  }
++  return std::filesystem::absolute(mods_dir, ec);
++}
++
++void Runtime::AddModsOverlay(const std::filesystem::path& overlay_path) {
++  extra_mods_overlays_.push_back(overlay_path);
++}
+ 
+ Runtime* Runtime::instance() {
+   return instance_;
+@@ -307,6 +335,18 @@ bool Runtime::SetupVfs() {
+   auto mount_path = "\\Device\\Harddisk0\\Partition1";
+   auto device = std::make_unique<rex::filesystem::HostPathDevice>(
+       mount_path, abs_game_root, !REXCVAR_GET(allow_game_relative_writes));
++  // App-generated overlays (fixes the app makes, e.g. rebuilt indexes) apply even with
++  // the mods folder switched off.
++  for (const auto& overlay_path : extra_mods_overlays_) {
++    device->add_overlay_path(overlay_path);
++  }
++  if (REXCVAR_GET(mods_enabled)) {
++    if (auto mods_dir = ResolveModsRoot(); !mods_dir.empty()) {
++      device->add_overlay_path(mods_dir);
++    }
++  } else {
++    REXSYS_INFO("Mods overlay disabled (mods_enabled = false)");
++  }
+   if (!device->Initialize()) {
+     REXSYS_ERROR("Runtime::SetupVfs: Failed to initialize host path device");
+     return false;
+@@ -350,9 +390,22 @@ bool Runtime::SetupVfs() {
+     REXSYS_DEBUG("  Registered NullDevice for \\Device\\Harddisk0\\{{Partition0,Cache0,Cache1}}");
+   }
+ 
+-  // NOTE: Do NOT register a device for cache: paths
+-  // Games handle "device not found" gracefully but don't handle actual device
+-  // errors (like NAME_COLLISION) well. Let cache: fail cleanly.
++  // The 360's HDD cache partition (CACHE:). Some games copy archives there and
++  // take a different loading path when it is missing (SvR07 creates
++  // CACHE:\PAC\{M.PAC,MENU,...}); Xenia provides it, so offer it by default.
++  if (REXCVAR_GET(mount_cache_partition)) {
++    const auto cache_dir = std::filesystem::absolute(
++        (cache_root_.empty() ? (user_data_root_ / "cache") : cache_root_) / "xbox_cache");
++    auto cache_device =
++        std::make_unique<rex::filesystem::HostPathDevice>("\\Device\\Cache0", cache_dir, false);
++    if (cache_device->Initialize()) {
++      file_system_->RegisterDevice(std::move(cache_device));
++      file_system_->RegisterSymbolicLink("cache:", "\\Device\\Cache0");
++      REXSYS_INFO("  Mounted cache: at {}", rex::path_to_utf8(cache_dir));
++    } else {
++      REXSYS_WARN("  Failed to mount cache: at {}", rex::path_to_utf8(cache_dir));
++    }
++  }
+ 
+   return true;
+ }
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 76cc877..e6b0313 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -556,6 +556,21 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
+   // Will be rounded to physical page boundaries internally, so just pass 1 as
+   // the length - guranteed not to cross page boundaries also.
+   auto physical_heap = static_cast<PhysicalHeap*>(heap);
++
++  // A read-watched page holds stale data until the provider fills it - both
++  // reads and writes (a write must not land on stale neighbouring bytes) wait.
++  if (physical_heap->IsReadWatched(virtual_address)) {
++    uint32_t physical_address = physical_heap->GetPhysicalAddress(virtual_address);
++    if (physical_memory_data_provider_) {
++      return physical_memory_data_provider_(physical_memory_data_provider_context_,
++                                            physical_address,
++                                            std::move(global_lock_locked_once));
++    }
++    // No provider anymore - give the page back as it is.
++    DisablePhysicalMemoryReadWatch(physical_address, 1);
++    return true;
++  }
++
+   if (physical_heap->TriggerCallbacks(std::move(global_lock_locked_once), virtual_address, 1,
+                                       is_write, false)) {
+     return true;
+@@ -679,6 +694,61 @@ void Memory::UnregisterPhysicalMemoryInvalidationCallback(void* callback_handle)
+   delete entry;
+ }
+ 
++void Memory::SetPhysicalMemoryDataProvider(PhysicalMemoryDataProvider provider, void* context) {
++  auto lock = global_critical_region_.Acquire();
++  physical_memory_data_provider_ = provider;
++  physical_memory_data_provider_context_ = context;
++}
++
++bool Memory::EnablePhysicalMemoryReadWatch(uint32_t physical_address, uint32_t length) {
++  auto lock = global_critical_region_.Acquire();
++  bool watched = heaps_.vA0000000.EnableReadWatch(physical_address, length);
++  watched |= heaps_.vC0000000.EnableReadWatch(physical_address, length);
++  watched |= heaps_.vE0000000.EnableReadWatch(physical_address, length);
++  return watched;
++}
++
++void Memory::DisablePhysicalMemoryReadWatch(uint32_t physical_address, uint32_t length) {
++  auto lock = global_critical_region_.Acquire();
++  heaps_.vA0000000.DisableReadWatch(physical_address, length);
++  heaps_.vC0000000.DisableReadWatch(physical_address, length);
++  heaps_.vE0000000.DisableReadWatch(physical_address, length);
++}
++
++bool Memory::IsPhysicalMemoryReadWatched(uint32_t physical_address) const {
++  return heaps_.vA0000000.IsPhysicalPageReadWatched(physical_address) ||
++         heaps_.vC0000000.IsPhysicalPageReadWatched(physical_address) ||
++         heaps_.vE0000000.IsPhysicalPageReadWatched(physical_address);
++}
++
++void Memory::ProvidePhysicalMemoryData(uint32_t virtual_address, uint32_t length) {
++  if (!length) {
++    return;
++  }
++  BaseHeap* heap = LookupHeap(virtual_address);
++  if (!heap || heap->heap_type() != memory::HeapType::kGuestPhysical) {
++    return;
++  }
++  auto physical_heap = static_cast<PhysicalHeap*>(heap);
++  const uint32_t page_size = system_page_size_;
++  uint64_t end = uint64_t(virtual_address) + length;
++  for (uint64_t address = virtual_address & ~(page_size - 1); address < end;
++       address += page_size) {
++    auto lock = global_critical_region_.Acquire();
++    // Each call fills a whole resolve, usually covering the following pages.
++    while (physical_heap->IsReadWatched(uint32_t(address))) {
++      uint32_t physical_address = physical_heap->GetPhysicalAddress(uint32_t(address));
++      if (!physical_memory_data_provider_) {
++        DisablePhysicalMemoryReadWatch(physical_address, 1);
++        break;
++      }
++      physical_memory_data_provider_(physical_memory_data_provider_context_, physical_address,
++                                     std::move(lock));
++      lock = global_critical_region_.Acquire();
++    }
++  }
++}
++
+ void Memory::EnablePhysicalMemoryAccessCallbacks(uint32_t physical_address, uint32_t length,
+                                                  bool enable_invalidation_notifications,
+                                                  bool enable_data_providers) {
+@@ -1498,8 +1568,8 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t
+   }
+   if (start_page_number == UINT_MAX || end_page_number == UINT_MAX) {
+     // Out of memory.
+-    REXSYS_ERROR("BaseHeap::Alloc failed to find contiguous range");
+-    assert_always("Heap exhausted!");
++    // (HollywoodAkeem tweak) soft-fail: the game probes memory and handles failure itself.
++    REXSYS_WARN("BaseHeap::Alloc failed to find contiguous range");
+     return false;
+   }
+ 
+@@ -1912,7 +1982,11 @@ bool PhysicalHeap::Alloc(uint32_t size, uint32_t alignment, uint32_t allocation_
+   uint32_t parent_address;
+   if (!parent_heap_->AllocRange(parent_heap_start, parent_heap_end, size, alignment,
+                                 allocation_type, protect, top_down, &parent_address)) {
+-    REXSYS_ERROR("PhysicalHeap::Alloc unable to alloc physical memory in parent heap");
++    REXSYS_ERROR(
++        "PhysicalHeap::Alloc unable to alloc physical memory in parent heap ({:#x} bytes, align "
++        "{:#x}, heap {:08X}; parent free {} of {} pages)",
++        size, alignment, heap_base_, parent_heap_->GetUnreservedPageCount(),
++        parent_heap_->GetTotalPageCount());
+     return false;
+   }
+ 
+@@ -1924,6 +1998,14 @@ bool PhysicalHeap::Alloc(uint32_t size, uint32_t alignment, uint32_t allocation_
+     // TODO(benvanik): don't leak parent memory.
+     return false;
+   }
++  // RR-NR-6 (port of UFC sdk 0014): allocation set the guest's protection, which replaced any
++  // read watch on these pages.
++  {
++    uint32_t system_page_first, system_page_last;
++    if (GetSystemPageRange(GetPhysicalAddress(address), size, system_page_first, system_page_last)) {
++      ClearReadWatches(system_page_first, system_page_last, false);
++    }
++  }
+   *out_address = address;
+   return true;
+ }
+@@ -1945,7 +2027,10 @@ bool PhysicalHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t ali
+   // TODO(benvanik): flag for ensure-not-committed?
+   uint32_t parent_base_address = GetPhysicalAddress(base_address);
+   if (!parent_heap_->AllocFixed(parent_base_address, size, alignment, allocation_type, protect)) {
+-    REXSYS_ERROR("PhysicalHeap::Alloc unable to alloc physical memory in parent heap");
++    REXSYS_ERROR(
++        "PhysicalHeap::AllocFixed unable to alloc physical memory in parent heap ({:#x} bytes at "
++        "{:08X})",
++        size, base_address);
+     return false;
+   }
+ 
+@@ -1958,6 +2043,14 @@ bool PhysicalHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t ali
+     return false;
+   }
+ 
++  // RR-NR-6 (port of UFC sdk 0014): allocation set the guest's protection, which replaced any
++  // read watch on these pages.
++  {
++    uint32_t system_page_first, system_page_last;
++    if (GetSystemPageRange(GetPhysicalAddress(address), size, system_page_first, system_page_last)) {
++      ClearReadWatches(system_page_first, system_page_last, false);
++    }
++  }
+   return true;
+ }
+ 
+@@ -1983,7 +2076,11 @@ bool PhysicalHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint3
+   uint32_t parent_address;
+   if (!parent_heap_->AllocRange(parent_low_address, parent_high_address, size, alignment,
+                                 allocation_type, protect, top_down, &parent_address)) {
+-    REXSYS_ERROR("PhysicalHeap::Alloc unable to alloc physical memory in parent heap");
++    REXSYS_ERROR(
++        "PhysicalHeap::AllocRange unable to alloc physical memory in parent heap ({:#x} bytes, "
++        "align {:#x}, range {:08X}-{:08X}; parent free {} of {} pages)",
++        size, alignment, low_address, high_address, parent_heap_->GetUnreservedPageCount(),
++        parent_heap_->GetTotalPageCount());
+     return false;
+   }
+ 
+@@ -1995,6 +2092,12 @@ bool PhysicalHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint3
+     // TODO(benvanik): don't leak parent memory.
+     return false;
+   }
++  {
++    uint32_t system_page_first, system_page_last;  // RR-NR-6: as Alloc
++    if (GetSystemPageRange(GetPhysicalAddress(address), size, system_page_first, system_page_last)) {
++      ClearReadWatches(system_page_first, system_page_last, false);
++    }
++  }
+   *out_address = address;
+   return true;
+ }
+@@ -2052,6 +2155,13 @@ bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
+   // marking some range as immutable, for instance.
+   if (protect & memory::kMemoryProtectWrite) {
+     TriggerCallbacks(std::move(global_lock), address, size, true, true, false);
++  } else {
++    // The new protection replaces any read watch.
++    uint32_t system_page_first, system_page_last;
++    if (GetSystemPageRange(GetPhysicalAddress(address), size, system_page_first,
++                           system_page_last)) {
++      ClearReadWatches(system_page_first, system_page_last, false);
++    }
+   }
+ 
+   if (!parent_heap_->Protect(GetPhysicalAddress(address), size, protect, old_protect)) {
+@@ -2145,10 +2255,8 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
+       if (enable_invalidation_notifications) {
+         if (current_page_access != rex::memory::PageAccess::kReadOnly &&
+             (page_flags_block.notify_on_invalidation & page_flags_bit) == 0) {
+-          // TODO(Triang3l): Check if data providers are already enabled.
+-          // If data providers are already enabled for the page, it has even
+-          // stricter protection.
+-          protect_system_page = true;
++          // A read-watched page already has stricter protection.
++          protect_system_page = (page_flags_block.notify_on_read & page_flags_bit) == 0;
+           page_flags_block.notify_on_invalidation |= page_flags_bit;
+         }
+       }
+@@ -2205,6 +2313,10 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
+   uint32_t block_index_first = system_page_first >> 6;
+   uint32_t block_index_last = system_page_last >> 6;
+ 
++  // The range was written outside the guest views (a file read) or is being
++  // released or reprotected - the provider's data for it is outdated.
++  ClearReadWatches(system_page_first, system_page_last, true);
++
+   // Check if watching any page, whether need to call the callback at all.
+   bool any_watched = false;
+   for (uint32_t i = block_index_first; i <= block_index_last; ++i) {
+@@ -2283,9 +2395,11 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
+     uint8_t* protect_base = membase_ + heap_base_;
+     uint32_t unprotect_system_page_first = UINT32_MAX;
+     for (uint32_t i = system_page_first; i <= system_page_last; ++i) {
+-      // Check if need to allow writing to this page.
++      // Check if need to allow writing to this page. Read-watched pages around
++      // the requested range stay hidden.
+       bool unprotect_page =
+-          (system_page_flags_[i >> 6].notify_on_invalidation & (uint64_t(1) << (i & 63))) != 0;
++          (system_page_flags_[i >> 6].notify_on_invalidation & (uint64_t(1) << (i & 63))) != 0 &&
++          (system_page_flags_[i >> 6].notify_on_read & (uint64_t(1) << (i & 63))) == 0;
+       if (unprotect_page) {
+         uint32_t guest_page_number =
+             rex::sat_sub(i * system_page_size_, host_address_offset()) >> page_size_shift_;
+@@ -2347,6 +2461,147 @@ bool PhysicalHeap::IsHostPageWriteWatched(uint32_t host_page_number) const {
+           (uint64_t(1) << (host_page_number & 63))) != 0;
+ }
+ 
++bool PhysicalHeap::GetSystemPageRange(uint32_t physical_address, uint32_t length,
++                                      uint32_t& first, uint32_t& last) const {
++  // Same mapping as EnableAccessCallbacks.
++  uint32_t physical_address_offset = GetPhysicalAddress(heap_base_);
++  if (physical_address < physical_address_offset) {
++    if (physical_address_offset - physical_address >= length) {
++      return false;
++    }
++    length -= physical_address_offset - physical_address;
++    physical_address = physical_address_offset;
++  }
++  uint32_t heap_relative_address = physical_address - physical_address_offset;
++  if (heap_relative_address >= heap_size_) {
++    return false;
++  }
++  length = std::min(length, heap_size_ - heap_relative_address);
++  if (!length) {
++    return false;
++  }
++  first = (heap_relative_address + host_address_offset()) / system_page_size_;
++  last = std::min((heap_relative_address + length - 1 + host_address_offset()) / system_page_size_,
++                  system_page_count_ - 1);
++  return first <= last;
++}
++
++rex::memory::PageAccess PhysicalHeap::GetUnreadWatchedAccess(uint32_t system_page) const {
++  uint32_t guest_page_number =
++      rex::sat_sub(system_page * system_page_size_, host_address_offset()) >> page_size_shift_;
++  if (guest_page_number >= page_table_.size()) {
++    return rex::memory::PageAccess::kNoAccess;
++  }
++  rex::memory::PageAccess access = ToPageAccess(page_table_[guest_page_number].current_protect);
++  if (access == rex::memory::PageAccess::kReadWrite &&
++      (system_page_flags_[system_page >> 6].notify_on_invalidation &
++       (uint64_t(1) << (system_page & 63)))) {
++    access = rex::memory::PageAccess::kReadOnly;
++  }
++  return access;
++}
++
++bool PhysicalHeap::EnableReadWatch(uint32_t physical_address, uint32_t length) {
++  uint32_t system_page_first, system_page_last;
++  if (!GetSystemPageRange(physical_address, length, system_page_first, system_page_last)) {
++    return false;
++  }
++  uint8_t* protect_base = membase_ + heap_base_;
++  bool any_watched = false;
++  uint32_t protect_first = UINT32_MAX;
++  for (uint32_t i = system_page_first; i <= system_page_last + 1; ++i) {
++    bool protect_page = false;
++    if (i <= system_page_last) {
++      uint64_t& flags = system_page_flags_[i >> 6].notify_on_read;
++      uint64_t bit = uint64_t(1) << (i & 63);
++      if (flags & bit) {
++        any_watched = true;
++      } else if (GetUnreadWatchedAccess(i) != rex::memory::PageAccess::kNoAccess) {
++        // Inaccessible pages need real access violations - not watched.
++        flags |= bit;
++        any_watched = true;
++        protect_page = true;
++      }
++    }
++    if (protect_page) {
++      if (protect_first == UINT32_MAX) {
++        protect_first = i;
++      }
++    } else if (protect_first != UINT32_MAX) {
++      rex::memory::Protect(protect_base + size_t(protect_first) * system_page_size_,
++                           size_t(i - protect_first) * system_page_size_,
++                           rex::memory::PageAccess::kNoAccess);
++      protect_first = UINT32_MAX;
++    }
++  }
++  return any_watched;
++}
++
++void PhysicalHeap::DisableReadWatch(uint32_t physical_address, uint32_t length) {
++  uint32_t system_page_first, system_page_last;
++  if (GetSystemPageRange(physical_address, length, system_page_first, system_page_last)) {
++    ClearReadWatches(system_page_first, system_page_last, true);
++  }
++}
++
++void PhysicalHeap::ClearReadWatches(uint32_t system_page_first, uint32_t system_page_last,
++                                    bool restore_protection) {
++  // Runs of pages getting the same access share one Protect call.
++  uint8_t* protect_base = membase_ + heap_base_;
++  uint32_t run_first = UINT32_MAX;
++  rex::memory::PageAccess run_access = rex::memory::PageAccess::kNoAccess;
++  auto flush_run = [&](uint32_t run_end) {
++    if (run_first != UINT32_MAX) {
++      rex::memory::Protect(protect_base + size_t(run_first) * system_page_size_,
++                           size_t(run_end - run_first) * system_page_size_, run_access);
++      run_first = UINT32_MAX;
++    }
++  };
++  for (uint32_t i = system_page_first; i <= system_page_last; ++i) {
++    uint64_t& flags = system_page_flags_[i >> 6].notify_on_read;
++    uint64_t bit = uint64_t(1) << (i & 63);
++    if (!(flags & bit)) {
++      flush_run(i);
++      continue;
++    }
++    flags &= ~bit;
++    if (!restore_protection) {
++      continue;
++    }
++    rex::memory::PageAccess access = GetUnreadWatchedAccess(i);
++    if (run_first != UINT32_MAX && access != run_access) {
++      flush_run(i);
++    }
++    if (run_first == UINT32_MAX) {
++      run_first = i;
++      run_access = access;
++    }
++  }
++  flush_run(system_page_last + 1);
++}
++
++bool PhysicalHeap::IsReadWatched(uint32_t virtual_address) const {
++  if (virtual_address < heap_base_ || virtual_address - heap_base_ >= heap_size_) {
++    return false;
++  }
++  uint32_t system_page =
++      (virtual_address - heap_base_ + host_address_offset()) / system_page_size_;
++  if (system_page >= system_page_count_) {
++    return false;
++  }
++  return (system_page_flags_[system_page >> 6].notify_on_read &
++          (uint64_t(1) << (system_page & 63))) != 0;
++}
++
++bool PhysicalHeap::IsPhysicalPageReadWatched(uint32_t physical_address) const {
++  uint32_t system_page_first, system_page_last;
++  if (!GetSystemPageRange(physical_address, 1, system_page_first, system_page_last)) {
++    return false;
++  }
++  return (system_page_flags_[system_page_first >> 6].notify_on_read &
++          (uint64_t(1) << (system_page_first & 63))) != 0;
++}
++
+ uint32_t PhysicalHeap::GetPhysicalAddress(uint32_t address) const {
+   assert_true(address >= heap_base_);
+   address -= heap_base_;
+diff --git a/src/ui/imgui_drawer.cpp b/src/ui/imgui_drawer.cpp
+index f270f3c..a3dd024 100644
+--- a/src/ui/imgui_drawer.cpp
++++ b/src/ui/imgui_drawer.cpp
+@@ -412,6 +412,7 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
+   io.DisplaySize.x = window_->GetActualPhysicalWidth() * physical_to_logical;
+   io.DisplaySize.y = window_->GetActualPhysicalHeight() * physical_to_logical;
+ 
++  ApplyGamepadInput(io);
+   ImGui::NewFrame();
+ 
+   assert_true(!IsDrawingDialogs());
+@@ -436,7 +437,18 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
+   // it now if needed.
+   DetachIfLastDialogRemoved();
+ 
+-  if (!dialogs_.empty()) {
++  // SVR07: only dialogs with something to show need continuous repaints. The
++  // always-alive achievement toast used to keep the UI thread presenting at the
++  // monitor refresh rate (165-220 presents/s on a 239 Hz screen, uneven frame
++  // pacing); when idle, painting follows guest frames instead.
++  bool any_active = false;
++  for (ImGuiDialog* dialog : dialogs_) {
++    if (!dialog->IsIdle()) {
++      any_active = true;
++      break;
++    }
++  }
++  if (any_active) {
+     // Repaint (and handle input) continuously if still active. In detached mode
+     // there is no presenter; the app drives repaint via its own present loop.
+     if (presenter_) {
+@@ -487,6 +499,61 @@ ImGuiIO& ImGuiDrawer::GetIO() {
+   return ImGui::GetIO();
+ }
+ 
++void ImGuiDrawer::SetGamepadInput(bool active, uint16_t buttons, int16_t lx, int16_t ly) {
++  uint64_t v = (uint64_t(active) << 63) | (uint64_t(buttons) << 32) |
++               (uint64_t(uint16_t(lx)) << 16) | uint64_t(uint16_t(ly));
++  gamepad_packed_.store(v, std::memory_order_relaxed);
++}
++
++void ImGuiDrawer::ApplyGamepadInput(ImGuiIO& io) {
++  uint64_t v = gamepad_packed_.load(std::memory_order_relaxed);
++  bool active = (v >> 63) != 0;
++  uint16_t buttons = active ? uint16_t(v >> 32) : 0;
++  int16_t lx = active ? int16_t((v >> 16) & 0xFFFF) : 0;
++  int16_t ly = active ? int16_t(v & 0xFFFF) : 0;
++  if (!active && !gamepad_prev_active_) {
++    return;
++  }
++  if (active) {
++    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
++    io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
++  }
++  struct Map {
++    uint16_t mask;
++    ImGuiKey key;
++  };
++  static const Map kMap[] = {
++      {0x0001, ImGuiKey_GamepadDpadUp},    {0x0002, ImGuiKey_GamepadDpadDown},
++      {0x0004, ImGuiKey_GamepadDpadLeft},  {0x0008, ImGuiKey_GamepadDpadRight},
++      {0x1000, ImGuiKey_GamepadFaceDown},  // A = activate
++      {0x2000, ImGuiKey_GamepadFaceRight},  // B = cancel
++      {0x4000, ImGuiKey_GamepadFaceLeft},  {0x8000, ImGuiKey_GamepadFaceUp},
++      {0x0100, ImGuiKey_GamepadL1},        {0x0200, ImGuiKey_GamepadR1},
++  };
++  for (const auto& m : kMap) {
++    bool now = (buttons & m.mask) != 0;
++    bool was = (gamepad_prev_buttons_ & m.mask) != 0;
++    if (now != was) {
++      io.AddKeyEvent(m.key, now);
++    }
++  }
++  // Left stick -> analog nav axes (dead zone 25%).
++  auto axis = [](int16_t a, bool positive) {
++    float f = float(a) / 32767.0f;
++    f = positive ? f : -f;
++    return f > 0.25f ? (f - 0.25f) / 0.75f : 0.0f;
++  };
++  io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickLeft, axis(lx, false) > 0, axis(lx, false));
++  io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickRight, axis(lx, true) > 0, axis(lx, true));
++  io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickUp, axis(ly, true) > 0, axis(ly, true));
++  io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickDown, axis(ly, false) > 0, axis(ly, false));
++  gamepad_prev_buttons_ = buttons;
++  gamepad_prev_active_ = active;
++  if (!active) {
++    io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
++  }
++}
++
+ void ImGuiDrawer::OnKeyDown(KeyEvent& e) {
+   OnKey(e, true);
+ }
+diff --git a/src/ui/overlay/achievement_toast.cpp b/src/ui/overlay/achievement_toast.cpp
+index 53b8c0b..6d440af 100644
+--- a/src/ui/overlay/achievement_toast.cpp
++++ b/src/ui/overlay/achievement_toast.cpp
+@@ -29,6 +29,11 @@ void AchievementToastDialog::Push(const rex::system::AchievementEvent& event) {
+   queue_.push_back({event, std::chrono::steady_clock::now()});
+ }
+ 
++bool AchievementToastDialog::IsIdle() {
++  std::lock_guard<std::mutex> lock(mutex_);
++  return queue_.empty();
++}
++
+ void AchievementToastDialog::OnDraw(ImGuiIO& io) {
+   auto now = std::chrono::steady_clock::now();
+ 
+diff --git a/src/ui/overlay/settings_overlay.cpp b/src/ui/overlay/settings_overlay.cpp
+index 4ede107..77bde11 100644
+--- a/src/ui/overlay/settings_overlay.cpp
++++ b/src/ui/overlay/settings_overlay.cpp
+@@ -13,19 +13,73 @@
+ #include <rex/cvar.h>
+ #include <rex/string.h>
+ #include <rex/string/numeric.h>
++#include <rex/string.h>
++#include <rex/string/numeric.h>
+ #include <rex/ui/keybinds.h>
++#include <rex/logging.h>
+ #include <imgui.h>
+ 
+ #include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <ctime>
+ #include <map>
+ #include <set>
+ #include <string>
+ #include <vector>
++#ifdef _WIN32
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <shellapi.h>
++#pragma comment(lib, "shell32.lib")
++#endif
+ 
+ namespace rex::ui {
+ 
+-SettingsDialog::SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path)
+-    : ImGuiDialog(imgui_drawer), config_path_(std::move(config_path)) {}
++namespace {
++
++// Copy a save folder tree, leaving out the shader cache (large, rebuilt on demand).
++bool CopySaves(const std::filesystem::path& from, const std::filesystem::path& to,
++               std::string* error) {
++  std::error_code ec;
++  std::filesystem::create_directories(to, ec);
++  for (auto& entry : std::filesystem::directory_iterator(from, ec)) {
++    if (entry.path().filename() == "cache")
++      continue;
++    std::filesystem::copy(entry.path(), to / entry.path().filename(),
++                          std::filesystem::copy_options::recursive |
++                              std::filesystem::copy_options::overwrite_existing,
++                          ec);
++    if (ec) {
++      *error = ec.message();
++      return false;
++    }
++  }
++  if (ec) {
++    *error = ec.message();
++    return false;
++  }
++  return true;
++}
++
++}  // namespace
++
++SettingsDialog::SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path,
++                               std::function<void()> on_quit,
++                               std::function<void(bool)> set_fullscreen,
++                               std::function<bool()> is_fullscreen)
++    : ImGuiDialog(imgui_drawer),
++      config_path_(std::move(config_path)),
++      on_quit_(std::move(on_quit)),
++      set_fullscreen_(std::move(set_fullscreen)),
++      is_fullscreen_(std::move(is_fullscreen)) {}
+ 
+ SettingsDialog::~SettingsDialog() {}
+ 
+@@ -156,12 +210,270 @@ static rex::ui::VirtualKey ImGuiKeyToVirtualKey(ImGuiKey key) {
+   }
+ }
+ 
+-void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
++// Plain-language controls for the few settings players actually change. Every change is saved
++// to the config file right away.
++void SettingsDialog::DrawQuickSettings() {
++  struct Choice {
++    const char* label;
++    int value;
++  };
++  const float value_x = 200.0f;
++  auto set = [this](const char* name, const std::string& value) {
++    rex::cvar::SetFlagByName(name, value);
++    rex::cvar::SaveConfig(config_path_);
++  };
++  auto restart_note = [](const char* name) {
++    auto* info = rex::cvar::GetFlagInfo(name);
++    if (info && info->lifecycle == rex::cvar::Lifecycle::kRequiresRestart) {
++      ImGui::SameLine();
++      ImGui::TextDisabled("(applies next launch)");
++    }
++  };
++
++  ImGui::TextUnformatted("Quick settings");
++  ImGui::TextDisabled("Changes save automatically.");
++  ImGui::Spacing();
++
++  // Resolution scale: the game renders at 720p x scale.
++  if (rex::cvar::GetFlagInfo("resolution_scale")) {
++    static const Choice choices[] = {{"720p (original)", 1}, {"1440p", 2},      {"4K (2160p)", 3},
++                                     {"5K (2880p)", 4},      {"6K (3600p)", 5}, {"8K (4320p)", 6}};
++    int cur = std::atoi(rex::cvar::GetFlagByName("resolution_scale").c_str());
++    char custom[32];
++    std::snprintf(custom, sizeof(custom), "%dx (%dp)", cur, 720 * cur);
++    const char* preview = custom;
++    for (auto& c : choices) {
++      if (c.value == cur)
++        preview = c.label;
++    }
++    ImGui::PushID("resolution_scale");
++    ImGui::TextUnformatted("Render resolution");
++    ImGui::SameLine(value_x);
++    ImGui::SetNextItemWidth(220.0f);
++    if (ImGui::BeginCombo("##q", preview)) {
++      for (auto& c : choices) {
++        if (ImGui::Selectable(c.label, c.value == cur))
++          set("resolution_scale", std::to_string(c.value));
++      }
++      ImGui::EndCombo();
++    }
++    restart_note("resolution_scale");
++    ImGui::PopID();
++    ImGui::TextDisabled("Higher = sharper but harder on the GPU. Lower it if the game crashes.");
++  }
++
++  if (rex::cvar::GetFlagInfo("gpu_backend")) {
++    const std::string cur = rex::cvar::GetFlagByName("gpu_backend");
++    ImGui::PushID("gpu_backend");
++    ImGui::TextUnformatted("Graphics backend");
++    ImGui::SameLine(value_x);
++    ImGui::SetNextItemWidth(280.0f);
++    if (ImGui::BeginCombo("##q", cur == "d3d12" ? "Direct3D 12 (model glitches)" : "Vulkan")) {
++      if (ImGui::Selectable("Vulkan (recommended)", cur != "d3d12"))
++        set("gpu_backend", "vulkan");
++      if (ImGui::Selectable("Direct3D 12 (model glitches)", cur == "d3d12"))
++        set("gpu_backend", "d3d12");
++      ImGui::EndCombo();
++    }
++    ImGui::SameLine();
++    ImGui::TextDisabled("(applies next launch)");
++    ImGui::PopID();
++  }
++
++  // Fullscreen (live).
++  {
++    bool fs = is_fullscreen_ ? is_fullscreen_()
++                             : rex::string::from_string<bool>(rex::cvar::GetFlagByName("fullscreen"), false);
++    ImGui::PushID("fullscreen");
++    ImGui::TextUnformatted("Fullscreen (F11)");
++    ImGui::SameLine(value_x);
++    if (ImGui::Checkbox("##q", &fs)) {
++      if (set_fullscreen_)
++        set_fullscreen_(fs);
++      set("fullscreen", fs ? "true" : "false");
++    }
++    ImGui::PopID();
++  }
++
++  if (rex::cvar::GetFlagInfo("vsync")) {
++    bool v = rex::string::from_string<bool>(rex::cvar::GetFlagByName("vsync"), true);
++    ImGui::PushID("vsync");
++    ImGui::TextUnformatted("VSync");
++    ImGui::SameLine(value_x);
++    if (ImGui::Checkbox("##q", &v))
++      set("vsync", v ? "true" : "false");
++    restart_note("vsync");
++    ImGui::PopID();
++  }
++
++  if (rex::cvar::GetFlagInfo("present_effect") &&
++      rex::cvar::GetFlagInfo("present_cas_additional_sharpness")) {
++    struct Level {
++      const char* label;
++      double v;
++    };
++    static const Level levels[] = {{"Low", 0.2}, {"Medium", 0.5}, {"High", 0.8}, {"Max", 1.0}};
++    const std::string eff = rex::cvar::GetFlagByName("present_effect");
++    const double cur = std::atof(rex::cvar::GetFlagByName("present_cas_additional_sharpness").c_str());
++    int cur_idx = 0;
++    double best = 1e9;
++    for (int i = 0; i < 4; ++i) {
++      if (std::abs(levels[i].v - cur) < best) {
++        best = std::abs(levels[i].v - cur);
++        cur_idx = i;
++      }
++    }
++    int cur_entry = eff == "cas" ? 1 + cur_idx : 0;
++    auto entry_label = [&](int e) -> std::string {
++      return e == 0 ? "Off" : std::string("CAS, ") + levels[e - 1].label;
++    };
++    ImGui::PushID("sharpening");
++    ImGui::TextUnformatted("Sharpening (CAS)");
++    ImGui::SameLine(value_x);
++    ImGui::SetNextItemWidth(220.0f);
++    if (ImGui::BeginCombo("##q", entry_label(cur_entry).c_str())) {
++      for (int e = 0; e < 5; ++e) {
++        if (ImGui::Selectable(entry_label(e).c_str(), e == cur_entry)) {
++          if (e == 0) {
++            rex::cvar::SetFlagByName("present_effect", "bilinear");
++          } else {
++            rex::cvar::SetFlagByName("present_effect", "cas");
++            rex::cvar::SetFlagByName("present_cas_additional_sharpness",
++                                     std::to_string(levels[e - 1].v));
++          }
++          rex::cvar::SaveConfig(config_path_);
++        }
++      }
++      ImGui::EndCombo();
++    }
++    restart_note("present_effect");
++    ImGui::PopID();
++  }
++
++  if (rex::cvar::GetFlagInfo("pause_on_focus_loss")) {
++    bool v = rex::string::from_string<bool>(rex::cvar::GetFlagByName("pause_on_focus_loss"), true);
++    ImGui::PushID("pause_on_focus_loss");
++    ImGui::TextUnformatted("Mute + ignore pad");
++    ImGui::SameLine(value_x);
++    if (ImGui::Checkbox("##q", &v))
++      set("pause_on_focus_loss", v ? "true" : "false");
++    ImGui::SameLine();
++    ImGui::TextDisabled("(when the window is not focused)");
++    ImGui::PopID();
++  }
++
++  // Save backup / restore. Backups go to "<saves folder>-backups" beside the saves.
++  {
++    ImGui::Spacing();
++    ImGui::TextUnformatted("Saves");
++    std::error_code ec;
++    if (saves_dir_.empty() || !std::filesystem::is_directory(saves_dir_, ec)) {
++      ImGui::TextDisabled("Saves folder not found.");
++    } else {
++      const auto backups =
++          saves_dir_.parent_path() / (saves_dir_.filename().string() + "-backups");
++      if (ImGui::Button("Back up saves")) {
++        confirm_restore_ = false;
++        auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
++        std::tm tm_buf{};
++#ifdef _WIN32
++        localtime_s(&tm_buf, &now);
++#else
++        localtime_r(&now, &tm_buf);
++#endif
++        char stamp[32];
++        std::strftime(stamp, sizeof(stamp), "%Y-%m-%d_%H-%M-%S", &tm_buf);
++        std::string err;
++        if (CopySaves(saves_dir_, backups / stamp, &err)) {
++          save_status_ = "Backed up to " + backups.filename().string() + "\\" + stamp;
++        } else {
++          save_status_ = "Backup failed: " + err;
++        }
++        REXLOG_INFO("Saves: {}", save_status_);
++      }
++      ImGui::SameLine();
++      if (ImGui::Button("Restore latest"))
++        confirm_restore_ = true;
++      ImGui::SameLine();
++      if (ImGui::Button("Open saves folder")) {
++#ifdef _WIN32
++        ShellExecuteW(nullptr, L"open", saves_dir_.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
++#endif
++      }
++      if (confirm_restore_) {
++        std::filesystem::path latest;
++        for (auto& e : std::filesystem::directory_iterator(backups, ec)) {
++          if (e.is_directory(ec) && (latest.empty() || e.path().filename() > latest.filename()))
++            latest = e.path();
++        }
++        if (latest.empty()) {
++          save_status_ = "No backups found.";
++          confirm_restore_ = false;
++        } else {
++          ImGui::TextColored(imgui_drawer()->style().settings.warning,
++                             "Overwrite current saves with %s?", latest.filename().string().c_str());
++          if (ImGui::Button("Yes, restore")) {
++            std::string err;
++            if (CopySaves(latest, saves_dir_, &err))
++              save_status_ = "Restored " + latest.filename().string() +
++                             ". Restart the game to load it.";
++            else
++              save_status_ = "Restore failed: " + err;
++            REXLOG_INFO("Saves: {}", save_status_);
++            confirm_restore_ = false;
++          }
++          ImGui::SameLine();
++          if (ImGui::Button("Cancel"))
++            confirm_restore_ = false;
++        }
++      }
++      if (!save_status_.empty())
++        ImGui::TextDisabled("%s", save_status_.c_str());
++    }
++  }
++
++  // What the config currently says.
++  {
++    const int w = std::atoi(rex::cvar::GetFlagByName("window_width").c_str());
++    const int h = std::atoi(rex::cvar::GetFlagByName("window_height").c_str());
++    const int sc = std::atoi(rex::cvar::GetFlagByName("resolution_scale").c_str());
++    ImGui::Spacing();
++    ImGui::TextDisabled("Config: render %dp (%dx scale), window %dx%d", 720 * sc, sc, w, h);
++  }
++
++  if (on_quit_) {
++    ImGui::Spacing();
++    if (ImGui::Button("Quit game", ImVec2(140.0f, 0)))
++      on_quit_();
++    ImGui::SameLine();
++    ImGui::TextDisabled("F4 / B / Back+Start closes this menu");
++  }
++  ImGui::Spacing();
++}
++
++void SettingsDialog::OnDraw(ImGuiIO& io) {
++  // B (or Escape) closes the menu, unless it just closed a combo popup.
++  if ((ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) ||
++       ImGui::IsKeyPressed(ImGuiKey_Escape, false)) &&
++      !popup_open_prev_ && !io.WantTextInput && capturing_bind_name_.empty() && on_close_) {
++    on_close_();
++  }
++  struct PopupTracker {
++    bool& flag;
++    ~PopupTracker() {
++      flag = ImGui::IsPopupOpen(nullptr,
++                                ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
++    }
++  } popup_tracker{popup_open_prev_};
++
+   auto& registry = rex::cvar::GetRegistry();
+ 
+   // Collect sorted unique category paths.
+   std::set<std::string> category_set;
+   for (auto& entry : registry) {
++    // Debug-only flags (developer / test switches) are hidden from players (RR-NR-12).
++    if (entry.is_debug_only)
++      continue;
+     category_set.insert(entry.category);
+   }
+ 
+@@ -199,13 +511,19 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
+   const std::string search(search_buf_);
+   const bool searching = !search.empty();
+ 
+-  ImGui::SetNextWindowSize(ImVec2(620, 480), ImGuiCond_FirstUseEver);
++  ImGui::SetNextWindowSize(ImVec2(640, 560), ImGuiCond_FirstUseEver);
+   ImGui::SetNextWindowBgAlpha(0.85f);
+   if (!ImGui::Begin("Settings##rex", nullptr, ImGuiWindowFlags_NoCollapse)) {
+     ImGui::End();
+     return;
+   }
+ 
++  DrawQuickSettings();
++  if (!ImGui::CollapsingHeader("All engine settings (advanced)")) {
++    ImGui::End();
++    return;
++  }
++
+   // Search bar at the top (full width).
+   ImGui::SetNextItemWidth(-1.0f);
+   ImGui::InputText("##search", search_buf_, sizeof(search_buf_));
+@@ -291,6 +609,8 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
+ 
+   ImGui::BeginChild("##cvars", ImVec2(0, -30.0f), false);
+   for (auto& entry : registry) {
++    if (entry.is_debug_only)
++      continue;
+     // Filter by category (unless searching).
+     if (!searching) {
+       if (!category_matches(entry.category)) {
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index b94fe9e..a09a472 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -20,6 +20,7 @@
+ #include <rex/filesystem.h>
+ #include <rex/logging/sink.h>
+ #include <rex/logging.h>
++#include <rex/audio/audio_driver.h>
+ #include <rex/ui/overlay/achievement_toast.h>
+ #include <rex/ui/overlay/achievements_overlay.h>
+ #include <rex/ui/overlay/console_overlay.h>
+@@ -51,6 +52,142 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
+                       "GPU emulation")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++#if REX_PLATFORM_WIN32
++#include <atomic>
++#include <csignal>
++#include <Windows.h>
++#include <DbgHelp.h>
++#pragma comment(lib, "dbghelp.lib")
++#endif
++
++REXCVAR_DEFINE_BOOL(pause_on_focus_loss, true, "Window",
++                    "Mute audio and ignore pad input while the window is not focused")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_BOOL(crash_dumps, true, "Runtime",
++                    "On a host crash, log a stack trace and write a minidump to crashdumps\\");
++
++#if REX_PLATFORM_WIN32
++namespace {
++
++std::filesystem::path g_crash_dump_dir;
++std::atomic<bool> g_crash_handled{false};
++
++void LogStackTrace(CONTEXT* context) {
++  HANDLE process = GetCurrentProcess();
++  SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
++  SymInitialize(process, nullptr, TRUE);
++
++  CONTEXT ctx = *context;
++  STACKFRAME64 frame = {};
++  frame.AddrPC.Offset = ctx.Rip;
++  frame.AddrPC.Mode = AddrModeFlat;
++  frame.AddrFrame.Offset = ctx.Rbp;
++  frame.AddrFrame.Mode = AddrModeFlat;
++  frame.AddrStack.Offset = ctx.Rsp;
++  frame.AddrStack.Mode = AddrModeFlat;
++
++  alignas(SYMBOL_INFO) char symbol_buffer[sizeof(SYMBOL_INFO) + 256];
++  auto* symbol = reinterpret_cast<SYMBOL_INFO*>(symbol_buffer);
++  for (int i = 0; i < 48; ++i) {
++    if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, process, GetCurrentThread(), &frame, &ctx, nullptr,
++                     SymFunctionTableAccess64, SymGetModuleBase64, nullptr) ||
++        !frame.AddrPC.Offset) {
++      break;
++    }
++    DWORD64 address = frame.AddrPC.Offset;
++    std::memset(symbol_buffer, 0, sizeof(symbol_buffer));
++    symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
++    symbol->MaxNameLen = 255;
++    DWORD64 symbol_offset = 0;
++    IMAGEHLP_LINE64 line = {sizeof(IMAGEHLP_LINE64)};
++    DWORD line_offset = 0;
++    bool has_symbol = SymFromAddr(process, address, &symbol_offset, symbol);
++    bool has_line = SymGetLineFromAddr64(process, address, &line_offset, &line);
++    REXLOG_CRITICAL("  #{:02} {:016X} {}+0x{:X} {}:{}", i, address,
++                    has_symbol ? symbol->Name : "?", symbol_offset,
++                    has_line ? line.FileName : "", has_line ? line.LineNumber : 0);
++  }
++}
++
++void WriteMiniDump(EXCEPTION_POINTERS* exception_pointers) {
++  std::error_code ec;
++  std::filesystem::create_directories(g_crash_dump_dir, ec);
++  SYSTEMTIME t;
++  GetLocalTime(&t);
++  wchar_t name[64];
++  swprintf_s(name, L"crash_%04u%02u%02u_%02u%02u%02u.dmp", t.wYear, t.wMonth, t.wDay, t.wHour,
++             t.wMinute, t.wSecond);
++  auto path = g_crash_dump_dir / name;
++  HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
++                            FILE_ATTRIBUTE_NORMAL, nullptr);
++  if (file == INVALID_HANDLE_VALUE) {
++    return;
++  }
++  MINIDUMP_EXCEPTION_INFORMATION info = {GetCurrentThreadId(), exception_pointers, FALSE};
++  // Stacks and thread state only: the guest memory arena is far too large to include.
++  auto type = MINIDUMP_TYPE(MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithThreadInfo |
++                            MiniDumpWithUnloadedModules);
++  if (MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), file, type,
++                        exception_pointers ? &info : nullptr, nullptr, nullptr)) {
++    REXLOG_CRITICAL("Minidump written to {}", path.string());
++  }
++  CloseHandle(file);
++}
++
++LONG WINAPI UnhandledExceptionCallback(EXCEPTION_POINTERS* exception_pointers) {
++  if (g_crash_handled.exchange(true)) {
++    return EXCEPTION_CONTINUE_SEARCH;
++  }
++  const EXCEPTION_RECORD* record = exception_pointers->ExceptionRecord;
++  HMODULE module = nullptr;
++  char module_path[MAX_PATH] = "?";
++  if (GetModuleHandleExA(
++          GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++          static_cast<LPCSTR>(record->ExceptionAddress), &module)) {
++    GetModuleFileNameA(module, module_path, MAX_PATH);
++  }
++  REXLOG_CRITICAL("Unhandled host exception 0x{:08X} at {:016X} ({}+0x{:X}) on thread {}",
++                  uint32_t(record->ExceptionCode),
++                  reinterpret_cast<uintptr_t>(record->ExceptionAddress),
++                  std::filesystem::path(module_path).filename().string(),
++                  reinterpret_cast<uintptr_t>(record->ExceptionAddress) -
++                      reinterpret_cast<uintptr_t>(module),
++                  GetCurrentThreadId());
++  if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2) {
++    REXLOG_CRITICAL("  {} of address {:016X}",
++                    record->ExceptionInformation[0] == 1   ? "write"
++                    : record->ExceptionInformation[0] == 8 ? "execute"
++                                                           : "read",
++                    record->ExceptionInformation[1]);
++  }
++  LogStackTrace(exception_pointers->ContextRecord);
++  WriteMiniDump(exception_pointers);
++  rex::ShutdownLogging();
++  return EXCEPTION_CONTINUE_SEARCH;
++}
++
++void AbortSignalHandler(int) {
++  if (g_crash_handled.exchange(true)) {
++    return;
++  }
++  CONTEXT context;
++  RtlCaptureContext(&context);
++  REXLOG_CRITICAL("abort() called on thread {}", GetCurrentThreadId());
++  LogStackTrace(&context);
++  WriteMiniDump(nullptr);
++  rex::ShutdownLogging();
++}
++
++void InstallCrashHandler(const std::filesystem::path& dump_dir) {
++  g_crash_dump_dir = dump_dir;
++  SetUnhandledExceptionFilter(UnhandledExceptionCallback);
++  std::signal(SIGABRT, AbortSignalHandler);
++}
++
++}  // namespace
++#endif
++
+ namespace rex {
+ 
+ // --- ReXApp ---
+@@ -182,6 +319,12 @@ bool ReXApp::SetupEnvironment() {
+   if (std::filesystem::exists(config_path_))
+     REXLOG_DEBUG("Loaded config: {}", config_path_.filename().string());
+ 
++#if REX_PLATFORM_WIN32
++  if (REXCVAR_GET(crash_dumps)) {
++    InstallCrashHandler(exe_dir / "crashdumps");
++  }
++#endif
++
+   REXLOG_DEBUG("{} starting", GetName());
+   if (!game_data_root_.empty()) {
+     REXLOG_DEBUG("  Game directory: {}", game_data_root_.string());
+@@ -252,9 +395,30 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+     auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system());
+     if (input_sys) {
+       input_sys->SetActiveCallback([this]() {
++        // Release the mouse (show the cursor) whenever any overlay is open.
+         if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_)
+           return true;
+-        return !imgui_drawer_->GetIO().WantCaptureMouse;
++        return false;
++      });
++      // Pad: Back+Start toggles the F4 overlay; while it is open the pad drives
++      // the overlay (ImGui nav) and is hidden from the game.
++      input_sys->SetPadHook([this](const rex::input::X_INPUT_GAMEPAD& pad) {
++        const uint16_t b = pad.buttons;
++        constexpr uint16_t kCombo =
++            rex::input::X_INPUT_GAMEPAD_BACK | rex::input::X_INPUT_GAMEPAD_START;
++        const bool combo = (b & kCombo) == kCombo;
++        const bool was_combo = pad_combo_down_.exchange(combo);
++        if (combo && !was_combo && toggle_settings_) {
++          REXLOG_INFO("Pad: Back+Start toggles settings overlay");
++          app_context().CallInUIThreadDeferred([this] { toggle_settings_(); });
++        }
++        const bool open = settings_overlay_ != nullptr;
++        if (open) {
++          imgui_drawer_->SetGamepadInput(true, combo ? 0 : b, pad.thumb_lx, pad.thumb_ly);
++        }
++        // Hide the pad while open and while the combo is held (so the game
++        // never sees Back/Start of the toggle press).
++        return open || combo;
+       });
+     }
+   }
+@@ -370,9 +534,10 @@ bool ReXApp::SetupPresentation() {
+       }
+     }
+     window_->SetPresenter(presenter);
+-  } else if (!graphics_system) {
++  } else {
+     // Detached mode: the app brings its own renderer and drives its own paint
+-    // loop. ReXApp owns the returned drawer via immediate_drawer_.
++    // loop (no graphics system, or a presenter-less one such as the null GPU).
++    // ReXApp owns the returned drawer via immediate_drawer_.
+     immediate_drawer_ = OnCreateImmediateDrawer();
+     if (immediate_drawer_) {
+       SetupOverlays(/*presenter=*/nullptr, immediate_drawer_.get());
+@@ -409,12 +574,36 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
+       console_overlay_ = std::make_unique<ui::ConsoleDialog>(imgui_drawer_.get(), log_sink_);
+     }
+   });
+-  rex::ui::RegisterBind("bind_settings", "F4", "Toggle settings overlay", [this] {
++  toggle_settings_ = [this] {
+     if (settings_overlay_) {
+       settings_overlay_.reset();
++      imgui_drawer_->SetGamepadInput(false, 0, 0, 0);
+     } else {
+-      settings_overlay_ = std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_);
++      settings_overlay_ = std::make_unique<ui::SettingsDialog>(
++          imgui_drawer_.get(), config_path_, [this] {
++            // Deferred so the window isn't closed while the overlay is drawing.
++            app_context().CallInUIThreadDeferred([this] {
++              if (window_)
++                window_->RequestClose();
++            });
++          });
++      settings_overlay_->set_saves_dir(user_data_root_);
++      settings_overlay_->set_on_close([this] {
++        // Deferred: the dialog must not be destroyed while it is drawing.
++        app_context().CallInUIThreadDeferred([this] {
++          if (settings_overlay_) {
++            settings_overlay_.reset();
++            imgui_drawer_->SetGamepadInput(false, 0, 0, 0);
++          }
++        });
++      });
+     }
++  };
++  rex::ui::RegisterBind("bind_settings", "F4", "Toggle settings overlay",
++                        [this] { toggle_settings_(); });
++  rex::ui::RegisterBind("bind_fullscreen", "F11", "Toggle fullscreen", [] {
++    const bool now = rex::string::from_string<bool>(rex::cvar::GetFlagByName("fullscreen"), false);
++    rex::cvar::SetFlagByName("fullscreen", now ? "false" : "true");
+   });
+   rex::ui::RegisterBind("bind_achievements", "F7", "Toggle achievements overlay", [this] {
+     if (achievements_overlay_) {
+@@ -533,13 +722,25 @@ void ReXApp::OnDpiChanged(ui::UISetupEvent& e) {
+   OnDpiScaleChanged(float(window_->GetDpi()) / float(window_->GetMediumDpi()));
+ }
+ 
++// Alt-tab: mute audio and hide the pad from the game (no thread suspend). Kept in
++// the runtime DLL so the flags are the same instances the audio/input code reads.
++static void ApplyFocusBlock(bool focused) {
++  const bool block = !focused && REXCVAR_GET(pause_on_focus_loss);
++  rex::audio::g_audio_muted.store(block);
++  rex::input::g_input_blocked.store(block);
++  REXLOG_INFO("Window {}: audio {} / pad {}", focused ? "focused" : "unfocused",
++              block ? "muted" : "on", block ? "ignored" : "active");
++}
++
+ void ReXApp::OnGotFocus(ui::UISetupEvent& e) {
+   (void)e;
++  ApplyFocusBlock(true);
+   OnWindowFocusChanged(true);
+ }
+ 
+ void ReXApp::OnLostFocus(ui::UISetupEvent& e) {
+   (void)e;
++  ApplyFocusBlock(false);
+   OnWindowFocusChanged(false);
+ }
+ 
+@@ -561,6 +762,7 @@ void ReXApp::OnDestroy() {
+   rex::ui::UnregisterBind("bind_debug_overlay");
+   rex::ui::UnregisterBind("bind_console");
+   rex::ui::UnregisterBind("bind_settings");
++  rex::ui::UnregisterBind("bind_fullscreen");
+   rex::ui::UnregisterBind("bind_achievements");
+ 
+   // ImGui cleanup (reverse of setup)
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 23645ef..b47a029 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -15,6 +15,7 @@
+ #include <cstdint>
+ #include <cmath>
+ #include <cstring>
++#include <string>
+ #include <memory>
+ #include <utility>
+ #include <vector>
+@@ -58,6 +59,11 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
+ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
+                     "Allow FIFO relaxed present mode");
+ 
++// SVR07 self-tests: with the display off / session locked, FIFO presents block at DWM's slow rate and the
++// whole game ran ~12 fps. false = guest vsync stays (60 Hz vblank), host presents without waiting.
++REXCVAR_DEFINE_BOOL(vulkan_present_fifo, true, "UI/Vulkan",
++                    "With vsync on, present FIFO (false: mailbox/immediate, guest still 60 Hz)");
++
+ namespace rex {
+ namespace ui {
+ namespace vulkan {
+@@ -1381,7 +1387,13 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
+   // interfering with GPU command processing, and also to allow tearing so
+   // variable refresh rate may be used where it's available.
+   // Note: If the priorities here are changes, update the cvar descriptions.
+-  if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
++  // SVR07: honor the user's vsync setting (upstream always preferred IMMEDIATE, so vsync did
++  // nothing on Vulkan and the presenter ran uncapped).
++  const std::string vsync_value = rex::cvar::GetFlagByName("vsync");
++  const bool host_vsync = !(vsync_value == "false" || vsync_value == "0");
++  if (host_vsync && REXCVAR_GET(vulkan_present_fifo)) {
++    swapchain_create_info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
++  } else if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
+       std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_IMMEDIATE_KHR) !=
+           present_modes.cend()) {
+     // Allowing tearing to reduce latency, and possibly variable refresh rate
+diff --git a/src/ui/windowed_app_context_sdl.cpp b/src/ui/windowed_app_context_sdl.cpp
+index dc0b4c2..8b66b81 100644
+--- a/src/ui/windowed_app_context_sdl.cpp
++++ b/src/ui/windowed_app_context_sdl.cpp
+@@ -139,7 +139,14 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
+       break;
+     case SDL_EVENT_KEY_DOWN:
+     case SDL_EVENT_KEY_UP: {
+-      if (WindowSDL* window = GetWindow(event.key.windowID)) {
++      WindowSDL* window = GetWindow(event.key.windowID);
++      // SDL tags key events with the keyboard-focus window, so keys posted to
++      // an unfocused window arrive with no window (scripted testing with
++      // mnk_ignore_focus). With a single window there is only one target.
++      if (!window && event.key.windowID == 0 && windows_.size() == 1) {
++        window = windows_.begin()->second;
++      }
++      if (window) {
+         window->HandleKeyEvent(event);
+       }
+       break;
+diff --git a/include/rex/graphics/null/graphics_system.h b/include/rex/graphics/null/graphics_system.h
+new file mode 100644
+index 0000000..21f3cf8
+--- /dev/null
++++ b/include/rex/graphics/null/graphics_system.h
+@@ -0,0 +1,37 @@
++/**
++ * @file        graphics/null/graphics_system.h
++ * @brief       Guest GPU that keeps the command stream moving but draws nothing.
++ *
++ * Added for the WWE SmackDown vs. Raw 2008 native renderer. The game's own D3D library keeps
++ * running unmodified (device creation, ring buffer, fences, interrupts, vblank pacing); this
++ * backend consumes what it writes through the shared CommandProcessor (MMIO, fences, events,
++ * interrupts, waits) and skips every draw, resolve and swap. The app renders natively by hooking
++ * the game's D3D draw calls, and owns the window: there is no provider or presenter here, so
++ * ReXApp runs in its detached mode (OnCreateImmediateDrawer).
++ */
++
++#pragma once
++
++#include <memory>
++#include <string>
++
++#include <rex/graphics/command_processor.h>
++#include <rex/graphics/graphics_system.h>
++
++namespace rex::graphics::null_gpu {
++
++class NullGraphicsSystem : public GraphicsSystem {
++ public:
++  std::string name() const override { return "Null"; }
++
++  // No host GPU and no presenter: the app brings its own renderer.
++  X_STATUS SetupPresentation(::rex::ui::WindowedAppContext* app_context) override;
++
++ protected:
++  void CreateProvider(bool with_presentation) override;
++
++ private:
++  std::unique_ptr<CommandProcessor> CreateCommandProcessor() override;
++};
++
++}  // namespace rex::graphics::null_gpu
+diff --git a/include/rex/graphics/util/draw_trace.h b/include/rex/graphics/util/draw_trace.h
+new file mode 100644
+index 0000000..b15404a
+--- /dev/null
++++ b/include/rex/graphics/util/draw_trace.h
+@@ -0,0 +1,27 @@
++/**
++ * @file        draw_trace.h
++ * @brief       trace_draw_ps: per-draw shader constants of chosen pixel shaders
++ *              over a few frames (which constants differ between the draws of
++ *              one shader, e.g. per-mesh lighting of a skinned model).
++ */
++
++#pragma once
++
++#include <rex/graphics/register_file.h>
++
++namespace rex::graphics {
++class Shader;
++}
++
++namespace rex::graphics::draw_trace {
++
++// Command processor thread, at draw time (after the shaders are analyzed).
++// Logs the draw while a capture runs and its pixel shader is listed in
++// trace_draw_ps.
++void NoteDraw(const RegisterFile& regs, const Shader* vertex_shader, const Shader* pixel_shader);
++
++// Command processor thread, once per guest swap: ends a captured frame (prints
++// its per-shader diff summary) and decides whether the next one is captured.
++void OnFrame();
++
++}  // namespace rex::graphics::draw_trace
+diff --git a/src/graphics/null/graphics_system.cpp b/src/graphics/null/graphics_system.cpp
+new file mode 100644
+index 0000000..6e535f7
+--- /dev/null
++++ b/src/graphics/null/graphics_system.cpp
+@@ -0,0 +1,49 @@
++/**
++ * @file        graphics/null/graphics_system.cpp
++ * @brief       Null guest GPU: synchronization only, no rendering (see the header).
++ */
++
++#include <rex/graphics/null/graphics_system.h>
++
++#include <rex/logging.h>
++#include <rex/system/kernel_state.h>
++
++namespace rex::graphics::null_gpu {
++
++namespace {
++
++// Runs the shared packet processing (register writes, fences, events, interrupts, waits); every
++// operation that would need a host GPU is accepted and dropped.
++class NullCommandProcessor final : public CommandProcessor {
++ public:
++  using CommandProcessor::CommandProcessor;
++
++  void IssueSwap(uint32_t, uint32_t, uint32_t) override {}
++
++ protected:
++  bool SetupContext() override { return true; }
++  void ShutdownContext() override {}
++  Shader* LoadShader(xenos::ShaderType, uint32_t, const uint32_t*, uint32_t) override {
++    return nullptr;
++  }
++  bool IssueDraw(xenos::PrimitiveType, uint32_t, IndexBufferInfo*, bool) override { return true; }
++  bool IssueCopy() override { return true; }
++};
++
++}  // namespace
++
++X_STATUS NullGraphicsSystem::SetupPresentation(::rex::ui::WindowedAppContext* app_context) {
++  app_context_ = app_context;
++  REXGPU_INFO("Null GPU: guest command stream for synchronization only; the app renders");
++  return X_STATUS_SUCCESS;
++}
++
++void NullGraphicsSystem::CreateProvider(bool) {
++  // No host graphics provider.
++}
++
++std::unique_ptr<CommandProcessor> NullGraphicsSystem::CreateCommandProcessor() {
++  return std::make_unique<NullCommandProcessor>(this, kernel_state_);
++}
++
++}  // namespace rex::graphics::null_gpu
+diff --git a/src/graphics/util/draw_trace.cpp b/src/graphics/util/draw_trace.cpp
+new file mode 100644
+index 0000000..4786e32
+--- /dev/null
++++ b/src/graphics/util/draw_trace.cpp
+@@ -0,0 +1,398 @@
++/**
++ * @file        draw_trace.cpp
++ * @brief       trace_draw_ps: per-draw shader constants of chosen pixel shaders.
++ */
++
++#include <rex/graphics/util/draw_trace.h>
++
++#include <algorithm>
++#include <cctype>
++#include <cstring>
++#include <memory>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++#include <fmt/format.h>
++
++#include <rex/cvar.h>
++#include <rex/graphics/pipeline/shader/shader.h>
++#include <rex/graphics/registers.h>
++#include <rex/graphics/xenos.h>
++#include <rex/logging.h>
++
++REXCVAR_DEFINE_STRING(trace_draw_ps, "", "GPU",
++                      "Pixel shader hashes or hash prefixes (hex, comma separated, e.g. "
++                      "9796F3AC,7B7BD1AC): during trace_draw_frames frames, log every draw of "
++                      "them (VS / PS hash, indices, index / vertex buffers, textures, the PS and "
++                      "VS float constants and bool constants the shaders read; later draws of a "
++                      "shader in the frame print only the constants that differ from its first "
++                      "draw), then a per-shader summary of the constants that varied");
++
++REXCVAR_DEFINE_INT32(trace_draw_frames, 2, "GPU",
++                     "trace_draw_ps: frames per capture")
++    .range(1, 1000);
++
++REXCVAR_DEFINE_INT32(trace_draw_start, 0, "GPU",
++                     "trace_draw_ps: frames to wait, after a listed shader first draws, before "
++                     "the first capture")
++    .range(0, 1000000);
++
++REXCVAR_DEFINE_INT32(trace_draw_every, 0, "GPU",
++                     "trace_draw_ps: frames from one capture start to the next (0 = one capture)")
++    .range(0, 1000000);
++
++REXCVAR_DEFINE_INT32(trace_draw_captures, 16, "GPU",
++                     "trace_draw_ps: how many captures at most (with trace_draw_every)")
++    .range(1, 100000);
++
++namespace rex::graphics::draw_trace {
++
++namespace {
++
++constexpr uint32_t kFloatConstants = 256;
++
++struct ShaderConstants {
++  uint64_t shader_hash = 0;
++  uint32_t floats[kFloatConstants * 4];
++  uint64_t used[kFloatConstants / 64] = {};
++  uint64_t varied[kFloatConstants / 64] = {};
++};
++
++// The first draw of one pixel shader in the captured frame, and what changed
++// in the later ones.
++struct PsFrameState {
++  uint32_t draws = 0;
++  uint32_t first_draw = 0;
++  ShaderConstants ps;
++  ShaderConstants vs;
++  uint32_t vs_other_hashes = 0;
++  uint32_t bools[8];
++  uint32_t bools_used[8] = {};
++  uint32_t bools_varied[8] = {};
++};
++
++struct Tracer {
++  bool parsed = false;
++  std::vector<std::string> prefixes;
++  std::unordered_map<uint64_t, bool> listed_cache;
++  uint64_t frame = 0;
++  uint64_t first_seen_frame = 0;
++  bool capturing = false;
++  uint32_t capture = 0;
++  uint32_t capture_frame = 0;
++  uint32_t draw_in_frame = 0;
++  uint32_t logged_in_frame = 0;
++  // Pixel shaders in first-draw order.
++  std::vector<uint64_t> frame_order;
++  std::unordered_map<uint64_t, std::unique_ptr<PsFrameState>> frame_states;
++};
++
++Tracer& GetTracer() {
++  static Tracer tracer;
++  return tracer;
++}
++
++void Parse(Tracer& tracer) {
++  if (tracer.parsed) {
++    return;
++  }
++  tracer.parsed = true;
++  const std::string& list = REXCVAR_GET(trace_draw_ps);
++  size_t start = 0;
++  while (start <= list.size()) {
++    size_t end = list.find_first_of(",; ", start);
++    if (end == std::string::npos) {
++      end = list.size();
++    }
++    std::string item = list.substr(start, end - start);
++    if (item.size() > 2 && item[0] == '0' && (item[1] == 'x' || item[1] == 'X')) {
++      item = item.substr(2);
++    }
++    bool valid = !item.empty() && item.size() <= 16;
++    for (char& c : item) {
++      if (!std::isxdigit(uint8_t(c))) {
++        valid = false;
++      }
++      c = char(std::toupper(uint8_t(c)));
++    }
++    if (valid) {
++      tracer.prefixes.push_back(item);
++    } else if (!item.empty()) {
++      REXGPU_WARN("trace_draw_ps: ignoring \"{}\"", item);
++    }
++    start = end + 1;
++  }
++  if (!tracer.prefixes.empty()) {
++    REXGPU_WARN(
++        "trace_draw_ps: {} shader(s), {} frame(s) per capture, start {} frames after the first "
++        "draw, every {} frames, up to {} captures",
++        tracer.prefixes.size(), REXCVAR_GET(trace_draw_frames), REXCVAR_GET(trace_draw_start),
++        REXCVAR_GET(trace_draw_every), REXCVAR_GET(trace_draw_captures));
++  }
++}
++
++bool IsListed(Tracer& tracer, uint64_t hash) {
++  auto it = tracer.listed_cache.find(hash);
++  if (it != tracer.listed_cache.end()) {
++    return it->second;
++  }
++  std::string hex = fmt::format("{:016X}", hash);
++  bool listed = false;
++  for (const std::string& prefix : tracer.prefixes) {
++    if (hex.compare(0, prefix.size(), prefix) == 0) {
++      listed = true;
++      break;
++    }
++  }
++  tracer.listed_cache.emplace(hash, listed);
++  return listed;
++}
++
++float AsFloat(uint32_t value) {
++  float f;
++  std::memcpy(&f, &value, sizeof(f));
++  return f;
++}
++
++std::string FormatFloat4(uint32_t index, const uint32_t* value) {
++  return fmt::format(" c{}=({:.4g},{:.4g},{:.4g},{:.4g})", index, AsFloat(value[0]),
++                     AsFloat(value[1]), AsFloat(value[2]), AsFloat(value[3]));
++}
++
++// Reads the float constants the shader uses from the register file; compares
++// them to the shader's first draw when one is given.
++std::string ReadFloatConstants(const RegisterFile& regs, const Shader& shader, uint32_t base_reg,
++                               ShaderConstants& current, ShaderConstants* first) {
++  const Shader::ConstantRegisterMap& map = shader.constant_register_map();
++  std::string out;
++  for (uint32_t i = 0; i < kFloatConstants; ++i) {
++    if (!(map.float_bitmap[i / 64] & (uint64_t(1) << (i % 64)))) {
++      continue;
++    }
++    current.used[i / 64] |= uint64_t(1) << (i % 64);
++    uint32_t* value = &current.floats[i * 4];
++    std::memcpy(value, &regs.values[base_reg + i * 4], sizeof(uint32_t) * 4);
++    if (first) {
++      if (std::memcmp(value, &first->floats[i * 4], sizeof(uint32_t) * 4) == 0) {
++        continue;
++      }
++      first->varied[i / 64] |= uint64_t(1) << (i % 64);
++    }
++    out += FormatFloat4(i, value);
++  }
++  return out;
++}
++
++std::string FormatIndexList(const uint64_t* bits, uint32_t count) {
++  std::string out;
++  for (uint32_t i = 0; i < count; ++i) {
++    if (bits[i / 64] & (uint64_t(1) << (i % 64))) {
++      out += fmt::format(" c{}", i);
++    }
++  }
++  return out.empty() ? " none" : out;
++}
++
++std::string GetTexturesString(const RegisterFile& regs, const Shader* shader, const char* prefix) {
++  std::string out;
++  if (!shader) {
++    return out;
++  }
++  for (const Shader::TextureBinding& binding : shader->texture_bindings()) {
++    xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(binding.fetch_constant);
++    out += fmt::format(" {}tf{} {:08X} {}x{} fmt {} mip {}-{}", prefix, binding.fetch_constant,
++                       uint32_t(fetch.base_address) << 12, fetch.size_2d.width + 1,
++                       fetch.size_2d.height + 1, uint32_t(fetch.format),
++                       uint32_t(fetch.mip_min_level), uint32_t(fetch.mip_max_level));
++  }
++  return out;
++}
++
++void EndFrame(Tracer& tracer) {
++  for (uint64_t ps_hash : tracer.frame_order) {
++    const PsFrameState& state = *tracer.frame_states[ps_hash];
++    std::string bools;
++    for (uint32_t i = 0; i < 256; ++i) {
++      if (state.bools_varied[i / 32] & (uint32_t(1) << (i % 32))) {
++        bools += fmt::format(" b{}", i);
++      }
++    }
++    REXGPU_WARN(
++        "Draw trace {}.{} summary PS {:016X}: {} draws (first #{}); PS constants that varied:{}; "
++        "VS {:016X} constants that varied:{}{}; bools that varied:{}",
++        tracer.capture, tracer.capture_frame, ps_hash, state.draws, state.first_draw,
++        FormatIndexList(state.ps.varied, kFloatConstants), state.vs.shader_hash,
++        FormatIndexList(state.vs.varied, kFloatConstants),
++        state.vs_other_hashes
++            ? fmt::format(" ({} draws had another VS, not compared)", state.vs_other_hashes)
++            : std::string(),
++        bools.empty() ? " none" : bools);
++  }
++  REXGPU_WARN("Draw trace {}.{} (frame {}): end, {} of {} draws logged", tracer.capture,
++              tracer.capture_frame, tracer.frame, tracer.logged_in_frame, tracer.draw_in_frame);
++  tracer.frame_order.clear();
++  tracer.frame_states.clear();
++}
++
++}  // namespace
++
++void NoteDraw(const RegisterFile& regs, const Shader* vertex_shader, const Shader* pixel_shader) {
++  Tracer& tracer = GetTracer();
++  Parse(tracer);
++  if (tracer.prefixes.empty()) {
++    return;
++  }
++  ++tracer.draw_in_frame;
++  if (!pixel_shader || !vertex_shader) {
++    return;
++  }
++  uint64_t ps_hash = pixel_shader->ucode_data_hash();
++  if (!IsListed(tracer, ps_hash)) {
++    return;
++  }
++  if (!tracer.first_seen_frame) {
++    tracer.first_seen_frame = tracer.frame + 1;
++    REXGPU_WARN("trace_draw_ps: PS {:016X} first drew in frame {}", ps_hash, tracer.frame);
++  }
++  if (!tracer.capturing) {
++    return;
++  }
++  ++tracer.logged_in_frame;
++  uint32_t draw_index = tracer.draw_in_frame - 1;
++
++  std::unique_ptr<PsFrameState>& state_ptr = tracer.frame_states[ps_hash];
++  bool first = !state_ptr;
++  if (first) {
++    state_ptr = std::make_unique<PsFrameState>();
++    state_ptr->first_draw = draw_index;
++    tracer.frame_order.push_back(ps_hash);
++  }
++  PsFrameState& state = *state_ptr;
++  ++state.draws;
++  uint64_t vs_hash = vertex_shader->ucode_data_hash();
++
++  ShaderConstants ps_current;
++  std::string ps_consts = ReadFloatConstants(regs, *pixel_shader, XE_GPU_REG_SHADER_CONSTANT_256_X,
++                                             first ? state.ps : ps_current,
++                                             first ? nullptr : &state.ps);
++  std::string vs_consts;
++  bool vs_compared = first || vs_hash == state.vs.shader_hash;
++  if (first) {
++    state.vs.shader_hash = vs_hash;
++    state.ps.shader_hash = ps_hash;
++  }
++  {
++    ShaderConstants vs_current;
++    vs_consts = ReadFloatConstants(regs, *vertex_shader, XE_GPU_REG_SHADER_CONSTANT_000_X,
++                                   first ? state.vs : vs_current,
++                                   (first || !vs_compared) ? nullptr : &state.vs);
++    if (!vs_compared) {
++      ++state.vs_other_hashes;
++    }
++  }
++
++  // Bool constants either shader reads (one shared 256-bit file).
++  uint32_t bools[8];
++  std::memcpy(bools, &regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], sizeof(bools));
++  std::string bool_string;
++  for (uint32_t i = 0; i < 256; ++i) {
++    uint32_t bit = uint32_t(1) << (i % 32);
++    if (!((vertex_shader->constant_register_map().bool_bitmap[i / 32] |
++           pixel_shader->constant_register_map().bool_bitmap[i / 32]) &
++          bit)) {
++      continue;
++    }
++    bool value = (bools[i / 32] & bit) != 0;
++    if (first) {
++      state.bools_used[i / 32] |= bit;
++    } else {
++      if (((state.bools[i / 32] & bit) != 0) == value) {
++        continue;
++      }
++      state.bools_varied[i / 32] |= bit;
++    }
++    bool_string += fmt::format(" b{}={}", i, value ? 1 : 0);
++  }
++  if (first) {
++    std::memcpy(state.bools, bools, sizeof(bools));
++  }
++
++  auto draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
++  std::string index_string;
++  if (draw_initiator.source_select == xenos::SourceSelect::kDMA) {
++    index_string = fmt::format(" ib {:08X} {}-bit", regs[XE_GPU_REG_VGT_DMA_BASE],
++                               draw_initiator.index_size == xenos::IndexFormat::kInt32 ? 32 : 16);
++  } else {
++    index_string = draw_initiator.source_select == xenos::SourceSelect::kAutoIndex ? " auto"
++                                                                                   : " immediate";
++  }
++  std::string vertex_string;
++  for (const Shader::VertexBinding& binding : vertex_shader->vertex_bindings()) {
++    xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(binding.fetch_constant);
++    vertex_string += fmt::format(" vf{} {:08X} {}B stride {}", binding.fetch_constant,
++                                 uint32_t(fetch.address) << 2, uint32_t(fetch.size) << 2,
++                                 binding.stride_words * 4);
++  }
++
++  const char* kind = first ? "all" : "diff from first";
++  REXGPU_WARN(
++      "Draw trace {}.{} #{} VS {:016X} PS {:016X} prim {} indices {}{} indx_offset {} min/max "
++      "{}/{}{} textures:{}{}",
++      tracer.capture, tracer.capture_frame, draw_index, vs_hash, ps_hash,
++      uint32_t(draw_initiator.prim_type), uint32_t(draw_initiator.num_indices), index_string,
++      uint32_t(regs.Get<reg::VGT_INDX_OFFSET>().indx_offset),
++      uint32_t(regs.Get<reg::VGT_MIN_VTX_INDX>().min_indx),
++      uint32_t(regs.Get<reg::VGT_MAX_VTX_INDX>().max_indx), vertex_string,
++      GetTexturesString(regs, vertex_shader, "vs "), GetTexturesString(regs, pixel_shader, ""));
++  REXGPU_WARN("Draw trace {}.{} #{} ps {}:{}", tracer.capture, tracer.capture_frame, draw_index,
++              kind, ps_consts.empty() ? " same" : ps_consts);
++  REXGPU_WARN("Draw trace {}.{} #{} vs {}:{}", tracer.capture, tracer.capture_frame, draw_index,
++              vs_compared ? kind : "all (another VS than the first draw's)",
++              vs_consts.empty() ? " same" : vs_consts);
++  if (!bool_string.empty() || first) {
++    REXGPU_WARN("Draw trace {}.{} #{} bools {}:{}", tracer.capture, tracer.capture_frame,
++                draw_index, kind, bool_string.empty() ? " none" : bool_string);
++  }
++}
++
++void OnFrame() {
++  Tracer& tracer = GetTracer();
++  if (!tracer.parsed || tracer.prefixes.empty()) {
++    return;
++  }
++  if (tracer.capturing) {
++    EndFrame(tracer);
++  }
++  ++tracer.frame;
++  tracer.draw_in_frame = 0;
++  tracer.logged_in_frame = 0;
++  tracer.capturing = false;
++  if (!tracer.first_seen_frame) {
++    return;
++  }
++  int64_t relative =
++      int64_t(tracer.frame) - int64_t(tracer.first_seen_frame) - REXCVAR_GET(trace_draw_start);
++  if (relative < 0) {
++    return;
++  }
++  int64_t frames = REXCVAR_GET(trace_draw_frames);
++  int64_t every = REXCVAR_GET(trace_draw_every);
++  int64_t capture = 0;
++  int64_t capture_frame = relative;
++  if (every > 0) {
++    capture = relative / every;
++    capture_frame = relative % every;
++  }
++  if (capture_frame >= frames || capture >= REXCVAR_GET(trace_draw_captures)) {
++    return;
++  }
++  tracer.capturing = true;
++  tracer.capture = uint32_t(capture);
++  tracer.capture_frame = uint32_t(capture_frame);
++  if (!capture_frame) {
++    REXGPU_WARN("Draw trace {}: begin at frame {}", tracer.capture, tracer.frame);
++  }
++}
++
++}  // namespace rex::graphics::draw_trace

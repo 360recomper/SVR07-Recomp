@@ -1,0 +1,150 @@
+# Hand-written roster-expansion hooks (see docs/ROSTER_EXPANSION.md). The per-site
+# `cmp id,93` hooks are generated: config/roster_midasm.toml.
+
+# Select list (sub_822F8C08): each brand/mode loop ends in `cmpw cr6,r31,r28` (id vs 93
+# or 123); r23 counts entries. The hook carries the loop on through the extra ids.
+[[midasm_hook]]
+address = 0x822F8D40
+name = "RosterSelectListLoop"
+registers = ["cr6", "r31", "r28", "r23"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x822F8DFC
+name = "RosterSelectListLoop"
+registers = ["cr6", "r31", "r28", "r23"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x822F8E9C
+name = "RosterSelectListLoop"
+registers = ["cr6", "r31", "r28", "r23"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x822F8F5C
+name = "RosterSelectListLoop"
+registers = ["cr6", "r31", "r28", "r23"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x822F9018
+name = "RosterSelectListLoop"
+registers = ["cr6", "r31", "r28", "r23"]
+after_instruction = true
+
+
+# Self-test select picks (svr07_hooks.cpp SelftestSelectPick): after `clrlwi r10,r3,16` = the grid's hovered id,
+# at the compare and store into the picks entry (+884, 40-byte entries, id at +16). sub_82307370: r31 select,
+# r26 = 40 * player; sub_82308C00: r28.
+[[midasm_hook]]
+address = 0x8230745C
+name = "SelftestSelectPick"
+registers = ["r10", "r31", "r26"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x823074AC
+name = "SelftestSelectPick"
+registers = ["r10", "r31", "r26"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x82307520
+name = "SelftestSelectPick"
+registers = ["r10", "r31", "r26"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x82307570
+name = "SelftestSelectPick"
+registers = ["r10", "r31", "r26"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x82308D3C
+name = "SelftestSelectPick"
+registers = ["r10", "r31", "r28"]
+after_instruction = true
+
+# VS screen models (sub_8246A958): after `add r29,r22,r11` = entry r29 for entrant r30, before its id (+16) is read.
+[[midasm_hook]]
+address = 0x8246AA20
+name = "SelftestVsPick"
+registers = ["r29", "r30"]
+after_instruction = true
+
+
+# Match-up / preview screen model setup (sub_8246A958): a roster id's model size comes
+# from a 93-entry float table, 0x82041C88 + 4 + id*8 (`rlwinm r11,r25,3,0,28`, then lfsx).
+# An extra reads its base superstar's entry instead of past the table.
+[[midasm_hook]]
+address = 0x8246AB24
+name = "RosterPreviewSize"
+registers = ["r11", "r25"]
+after_instruction = true
+
+
+# Select-panel look (look= in a manifest): at each back_legend02/03 name load the name
+# register is swapped for back_<look>02/03 when the panel's id is an extra with a look.
+# sub_82324F68 / sub_82319BC0: `addi r5,r11,back_legend02`, id in r30.
+[[midasm_hook]]
+address = 0x82325030
+name = "RosterLook02"
+registers = ["r5", "r30"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x82319CA8
+name = "RosterLook02"
+registers = ["r5", "r30"]
+after_instruction = true
+
+# sub_8235E930 (GM mode): id in r29.
+[[midasm_hook]]
+address = 0x8235EB6C
+name = "RosterLook02"
+registers = ["r5", "r29"]
+after_instruction = true
+
+# sub_823086C0: brand from sub_82302A48(r31, r24), id in r24.
+[[midasm_hook]]
+address = 0x82308894
+name = "RosterLook02"
+registers = ["r5", "r24"]
+after_instruction = true
+
+# sub_824700E8: record from sub_821B9A70(r28), id in r28.
+[[midasm_hook]]
+address = 0x824702C4
+name = "RosterLook02"
+registers = ["r5", "r28"]
+after_instruction = true
+
+# sub_823A2A78 (GM mode): id = word at r31+144.
+[[midasm_hook]]
+address = 0x823A2F78
+name = "RosterLook02Gm"
+registers = ["r5", "r31"]
+after_instruction = true
+
+# sub_824A4128: id = word at r30.
+[[midasm_hook]]
+address = 0x824A4288
+name = "RosterLook02Ptr"
+registers = ["r5", "r30"]
+after_instruction = true
+
+# sub_82477750: id from r31's slot table (see RosterLook02Slot).
+[[midasm_hook]]
+address = 0x82477C44
+name = "RosterLook02Slot"
+registers = ["r5", "r31"]
+after_instruction = true
+
+# sub_82305048 (match-up, 512x256): `mr r6,r26` picks back_legend03, id in r29.
+[[midasm_hook]]
+address = 0x823051E4
+name = "RosterLook03"
+registers = ["r6", "r29"]
+after_instruction = true

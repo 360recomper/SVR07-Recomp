@@ -35,3 +35,18 @@ generated/default/*.d
 
 # Recompiled game code: generated locally by `rexglue codegen svr07_manifest.toml`, never committed.
 /generated/default/
+
+# Native renderer / release outputs (never commit: built from the player's own game files or binaries)
+shader_cache*.bin
+shader_cache.stamp
+pipelines_seed.bin
+*.exe
+*.dll
+*.pdb
+*.lib
+*.zip
+*.log
+*.dmp
+__pycache__/
+/dist/
+/userdata/

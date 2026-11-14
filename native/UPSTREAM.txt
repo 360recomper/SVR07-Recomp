@@ -1,0 +1,44 @@
+SvR07 native renderer: upstream record (SvR07 native port, lane L4, 2026-11-10)
+
+This native/ tree = a copy of the Rumble Roses XX native tree, renamed for SvR07:
+  Rumble Roses XX native tree (github.com/360recomper/rrxx-native)
+    last commit touching it: 5c929a33738149eafbc03f90d8523c99858665db (2026-11-09 03:49 -0500,
+    "RR-NR-12: native merged into the v1.5c dev tree (native default, emulated fallback); emulated regression passed")
+    plus that repo's uncommitted working-tree changes at copy time (2026-11-10: at least
+    src/native/crash_trace.cpp, ufc_geometry.cpp, ufc_pipeline_store.cpp, src/reblue/gpu/device.cpp,
+    src/reblue/gpu/hooks/draw.cpp were modified there); the copy is of the working tree, not of the commit.
+  Renamed for SvR07 on 2026-11-10 (text substitution over the whole tree):
+    rrxx_ -> svr07_, RRXX_ -> SVR07_, rr_d3d* -> svr07_d3d*, rumble_roses_xx_app -> svr07_app
+  Not copied: native/data/pipelines_seed.bin (per game; SvR07 needs its own seed, built from native test logs).
+  third_party/ is byte-identical to RR's native/third_party at copy time (diff -rq, 2026-11-10), minus .git folders.
+  Still Rumble Roses numbers inside (device/resource layout, D3D names): (internal port notes);
+  lane L3 rewrites them (tag SVR07-UNVERIFIED for every number not proven).
+
+The RR tree in turn came from UFC-native (its own record, kept below with RR's names restored):
+
+UFC-native (UFC 3 recomp native renderer, branch native-renderer)
+  commit 4f07593e774b970b055dc02a9f6a26b2a30901e0  (2026-11-07 22:14 -0500, "NR-14c: early list submits ...")
+  The copied files were clean at that commit (git status).
+
+Copied from it, then changed for RR (RR-NR-3, 2026-11-08):
+  src/reblue/gpu/d3d.h                      -> native/src/reblue/gpu/d3d.h       (+ RRXX_NATIVE_RENDERER branch, now SVR07_NATIVE_RENDERER)
+  src/reblue/gpu/resources.h                -> native/src/reblue/gpu/resources.h (+ RRXX_NATIVE_RENDERER branch, now SVR07_NATIVE_RENDERER)
+  src/native/ufc_d3d.h                      -> native/src/rr_d3d.h               (rewritten for RR; now svr07_d3d.h)
+  src/native/ufc_d3d_names.h                -> native/src/rr_d3d_names.h         (from research/rr-nr1; now svr07_d3d_names.h)
+  tools/native/shader_extract/{main.cpp,win_crypto.*,xex_image.*,CMakeLists.txt}
+                                            -> native/tools/native/shader_extract (rrxx_shader_cache, now svr07_shader_cache;
+                                               win_crypto and xex_image unchanged but the namespace)
+  tools/native/shader_extract/shader_set.*  -> rewritten: RR PACH/BPE/EPAC reader (port of research/rr-nr1/
+                                               extract_shaders.py + tools/cut-content/rrpac.py), no zlib, no patched variants
+
+XenosRecomp: zolaware/reblue-XenosRecomp 339af41 (339af41df2c23dbe3256c1c377716b81a0e0fe6b), patched in this order:
+  UFC-native patches/ xenosrecomp.patch, xenosrecomp-ufc.patch .. xenosrecomp-ufc6.patch
+  then native/patches/xenosrecomp-0e.patch (RR: 0x102A0E -> 0x102A11 upgrade in memory, key = XXH3 of the
+  original 0E bytes; cache entry flags bit 1 = translated from 0E). Usable by SvR07 as is (NR-3: SvR07 uses the
+  same old 0x102A0E container).
+  UFC's third_party/XenosRecomp working tree at the commit above = 339af41 + that stack, byte for byte (checked).
+plume: e0c8871 + 3 UFC patches + a PSO-diag print patch (RR lessons 5; native/tools/svr07_fetch_third_party.py).
+
+Lineage and licences: re:Blue (zolaware, BSD-3-Clause) -> SvR 2010 recomp native renderer by nefariousjosiah (GPL-3.0;
+SvR 2008's by the same author is the SvR07 reference) -> UFC-native -> RRXX native -> this tree. See LICENSE,
+LICENSE.reblue, THIRD-PARTY.md. Release credit handle for this port: YucaGuapo.

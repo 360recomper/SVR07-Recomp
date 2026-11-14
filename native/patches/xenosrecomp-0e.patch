@@ -1,0 +1,275 @@
+diff --git a/XenosRecomp/main.cpp b/XenosRecomp/main.cpp
+index 8c51476..9236a90 100644
+--- a/XenosRecomp/main.cpp
++++ b/XenosRecomp/main.cpp
+@@ -2,7 +2,9 @@
+ #include "shader_recompiler.h"
+ #include "dxc_compiler.h"
+ 
++#include <deque>
+ #include <mutex>
++#include <stdexcept>
+ #include <vector>
+ 
+ static std::unique_ptr<uint8_t[]> readAllBytes(const char* filePath, size_t& fileSize)
+@@ -32,6 +34,7 @@ struct RecompiledShader
+     uint32_t specConstantsMask = 0;
+     uint32_t flags = 0;
+     std::string sourceName;
++    std::string upgradeError;  // set when a 0E container could not be upgraded
+ };
+ 
+ // Per-shader recompile failures, collected from the parallel loop and reported before exit.
+@@ -50,6 +53,7 @@ static std::vector<ShaderFailure> g_failures;
+ //              u64 dxilCompressedSize; u64 dxilSize; }
+ //   entries  { u64 hash; u32 dxilOffset; u32 dxilSize; u32 specConstantsMask; u32 flags; }
+ //            flags bit 0: the vertex shader reads its streams itself (computed vfetch)
++//            flags bit 1: translated from an old 0x102A0E container (hash = the original bytes)
+ //            x entryCount, sorted by hash (XXH3 of the whole container, as the cpp cache)
+ //   zstd(all DXIL blobs)
+ // Shaders that failed are left out (listed on stderr); the runtime logs them as misses.
+@@ -100,6 +104,160 @@ static int writeBinaryCache(const char* output, const std::map<XXH64_hash_t, Rec
+     return 0;
+ }
+ 
++
++// Old XDK shader containers (0x102A0E0x: Rumble Roses XX's and SvR 2007's compiler, 2.0.2500 and
++// older). The translator reads only the 0x102A110x layout, so a 0E container is rewritten into it
++// in memory; the ucode and the constant table are copied unchanged (port of RRXX
++// research/rr-nr1/upgrade_0e.py). The cache key stays XXH3 of the ORIGINAL 0E bytes: that is what
++// the game hands CreateVertexShader / CreatePixelShader, so the run time hashes the same bytes
++// (virtualSize + physicalSize sit at +4 / +8 in both layouts).
++//
++//   0E header (24 bytes): flags virt phys defTab ctab shader
++//   11 header (36 bytes): flags virt phys 0 ctab defTab shader 0 0
++//   0E shader: f8 fC f10 ? interpInfo ?           VS then: f18 elems extras 0 <elements, interps, extras>
++//   11 shader: physOff size f8 fC f10 interpInfo  VS then: f18 elems extras   <elements, interps, extras>
++//   PS after the 6 dwords (both): f18 outputs interps...
++//   0E defTab: 0 1 0 0 size | {reg16 count16 values[count]}... (zero words skipped)
++//     floats inline, reg = 0x300 (VS) / 0x1300 (PS) + 16 * c; ints at 0x2320 + 4 * i, as in 11.
++//   11 defTab: 0 1 0 0 size | {reg16 count16 physOff}... | 0 | {reg16 count16 values[count]}... | 0 0
++//     float values live in the physical section, reg = c (VS) / 256 + c (PS).
++constexpr uint32_t kShaderFlagUpgraded0E = 2;  // cache entry flags bit 1: translated from a 0E container
++
++static uint32_t readBe32(const uint8_t* p)
++{
++    return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
++}
++
++static bool isContainer0E(const uint8_t* d, size_t avail)
++{
++    if (avail < 24)
++        return false;
++    const uint32_t flags = readBe32(d), virt = readBe32(d + 4), phys = readBe32(d + 8);
++    const uint32_t defTab = readBe32(d + 12), ctab = readBe32(d + 16), shader = readBe32(d + 20);
++    const uint64_t total = uint64_t(virt) + phys;
++    return (flags & 0xFFFFFF00) == 0x102A0E00 && total > 24 && total <= avail && virt < 0x100000 &&
++        phys < 0x100000 && ctab >= 24 && uint64_t(ctab) + 4 <= virt && shader >= 24 &&
++        uint64_t(shader) + 24 <= virt && defTab < virt;
++}
++
++static std::vector<uint8_t> upgradeContainer0E(const uint8_t* d, size_t size)
++{
++    auto need = [size](uint64_t o, uint64_t n)
++    {
++        if (o > size || n > size - o)
++            throw std::runtime_error("0e-upgrade: field points past the container");
++    };
++    auto U = [&](uint64_t o)
++    {
++        need(o, 4);
++        return readBe32(d + o);
++    };
++    auto put = [](std::vector<uint8_t>& v, uint32_t x)
++    {
++        v.push_back(uint8_t(x >> 24));
++        v.push_back(uint8_t(x >> 16));
++        v.push_back(uint8_t(x >> 8));
++        v.push_back(uint8_t(x));
++    };
++    const uint32_t fl = U(0), vs = U(4), ps = U(8), dt = U(12), ct = U(16), so = U(20);
++    const bool isPs = (fl & 1) == 0;
++    const uint32_t f8 = U(so), fC = U(so + 4), f10 = U(so + 8), ii = U(so + 16);
++    need(vs, ps);
++
++    struct FloatDef { uint32_t reg, count, offset; };
++    struct IntDef { uint32_t reg, count; uint64_t at; };
++    std::vector<FloatDef> fdefs;
++    std::vector<IntDef> idefs;
++    std::vector<uint8_t> phys;
++    if (dt)
++    {
++        const uint64_t words = U(uint64_t(dt) + 16) / 4;
++        need(uint64_t(dt) + 20, words * 4);
++        const uint32_t fBase = isPs ? 0x1300 : 0x300, fEnd = isPs ? 0x2300 : 0x1300;
++        for (uint64_t q = 0; q < words;)
++        {
++            const uint32_t x = U(dt + 20 + q * 4);
++            if (x == 0)
++            {
++                ++q;
++                continue;
++            }
++            const uint32_t reg = x >> 16, n = x & 0xFFFF;
++            const uint64_t at = dt + 20 + (q + 1) * 4;
++            q += 1 + n;
++            if (q > words)
++                throw std::runtime_error("0e-upgrade: definition table entry runs past the table");
++            if (reg >= 0x2320 && reg < 0x23A0)
++                idefs.push_back({ reg, n, at });
++            else if (reg >= fBase && reg < fEnd && (reg & 0xF) == 0 && n % 4 == 0)
++            {
++                fdefs.push_back({ (isPs ? 256u : 0u) + (reg - fBase) / 16, n, uint32_t(ps + phys.size()) });
++                phys.insert(phys.end(), d + at, d + at + uint64_t(n) * 4);
++            }
++            else
++                throw std::runtime_error(fmt::format("0e-upgrade: literal reg {:x} count {}", reg, n));
++        }
++    }
++    std::vector<uint8_t> body;
++    for (const auto& f : fdefs)
++    {
++        put(body, f.reg << 16 | f.count);
++        put(body, f.offset);
++    }
++    put(body, 0);
++    for (const auto& i : idefs)
++    {
++        put(body, i.reg << 16 | i.count);
++        body.insert(body.end(), d + i.at, d + i.at + uint64_t(i.count) * 4);
++    }
++    put(body, 0);
++    put(body, 0);
++
++    // New virtual section: header, constant table, definition table, shader.
++    const uint32_t ctSize = U(ct);
++    need(ct, uint64_t(ctSize) + 4);
++    std::vector<uint8_t> out(36);
++    out.insert(out.end(), d + ct, d + ct + 4 + ctSize);
++    out.resize((out.size() + 3) & ~size_t(3));
++    const uint32_t ct2 = 36;
++    const uint32_t dt2 = dt ? uint32_t(out.size()) : 0;
++    if (dt)
++    {
++        for (uint32_t w : { 0u, 1u, 0u, 0u, uint32_t(body.size()) })
++            put(out, w);
++        out.insert(out.end(), body.begin(), body.end());
++    }
++    const uint32_t so2 = uint32_t(out.size());
++    for (uint32_t w : { 0u, ps, f8, fC, f10, ii })
++        put(out, w);
++    if (isPs)
++    {
++        if (uint64_t(so) + 24 > vs)
++            throw std::runtime_error("0e-upgrade: pixel shader header runs past the virtual section");
++        out.insert(out.end(), d + so + 24, d + vs);
++    }
++    else
++    {
++        const uint32_t f18 = U(so + 24), cnt = U(so + 28), extra = U(so + 32), zero = U(so + 36);
++        if (zero != 0)
++            throw std::runtime_error("0e-upgrade: vertex shader header word +0x24 is not 0");
++        if (uint64_t(so) + 40 > vs)
++            throw std::runtime_error("0e-upgrade: vertex shader header runs past the virtual section");
++        for (uint32_t w : { f18, cnt, extra })
++            put(out, w);
++        out.insert(out.end(), d + so + 40, d + vs);
++    }
++    const uint32_t vs2 = uint32_t(out.size());
++    const uint32_t phys2 = ps + uint32_t(phys.size());
++    const uint32_t header[9] = { (fl & 0xFF) | 0x102A1100, vs2, phys2, 0, ct2, dt2, so2, 0, 0 };
++    for (int k = 0; k < 9; ++k)
++        for (int b = 0; b < 4; ++b)
++            out[k * 4 + b] = uint8_t(header[k] >> (24 - 8 * b));
++    out.insert(out.end(), d + vs, d + vs + ps);
++    out.insert(out.end(), phys.begin(), phys.end());
++    return out;
++}
++
+ int main(int argc, char** argv)
+ {
+ #ifndef XENOS_RECOMP_INPUT
+@@ -153,6 +311,7 @@ int main(int argc, char** argv)
+     if (std::filesystem::is_directory(input))
+     {
+         std::vector<std::unique_ptr<uint8_t[]>> files;
++        std::deque<std::vector<uint8_t>> upgraded;  // 0E containers rewritten to 11 (stable addresses)
+         std::map<XXH64_hash_t, RecompiledShader> shaders;
+ 
+         for (auto& file : std::filesystem::recursive_directory_iterator(input))
+@@ -172,7 +331,35 @@ int main(int argc, char** argv)
+                 auto shaderContainer = reinterpret_cast<const ShaderContainer*>(fileData.get() + i);
+                 size_t dataSize = shaderContainer->virtualSize + shaderContainer->physicalSize;
+ 
+-                if ((shaderContainer->flags & 0xFFFFFF00) == 0x102A1100 &&
++                if (isContainer0E(fileData.get() + i, fileSize - i))
++                {
++                    // Key on the original 0E bytes; translate the upgraded copy.
++                    XXH64_hash_t hash = XXH3_64bits(shaderContainer, dataSize);
++                    auto shader = shaders.try_emplace(hash);
++                    if (shader.second)
++                    {
++                        auto& entry = shader.first->second;
++                        try
++                        {
++                            upgraded.push_back(upgradeContainer0E(fileData.get() + i, dataSize));
++                            entry.data = upgraded.back().data();
++                        }
++                        catch (const std::exception& e)
++                        {
++                            entry.upgradeError = e.what();
++                        }
++                        entry.flags = kShaderFlagUpgraded0E;
++                        std::string stem = file.path().stem().string();
++                        if (containerIndex > 0)
++                            stem += fmt::format(".{}", containerIndex);
++                        entry.sourceName = std::move(stem);
++                        foundAny = true;
++                    }
++
++                    ++containerIndex;
++                    i += dataSize;
++                }
++                else if ((shaderContainer->flags & 0xFFFFFF00) == 0x102A1100 &&
+                     dataSize <= (fileSize - i) &&
+                     shaderContainer->field1C == 0 &&
+                     shaderContainer->field20 == 0)
+@@ -218,6 +405,12 @@ int main(int argc, char** argv)
+                     g_failures.push_back({hash, reason});
+                 };
+ 
++                if (!shader.upgradeError.empty())
++                {
++                    recordFailure(shader.upgradeError.c_str());
++                    return;
++                }
++
+                 thread_local ShaderRecompiler recompiler;
+                 recompiler = {};
+                 try
+@@ -231,7 +424,7 @@ int main(int argc, char** argv)
+                 }
+ 
+                 shader.specConstantsMask = recompiler.specConstantsMask;
+-                shader.flags = recompiler.computedFetch ? 1u : 0u;
++                shader.flags = (shader.flags & kShaderFlagUpgraded0E) | (recompiler.computedFetch ? 1u : 0u);
+ 
+                 if (!hlslDumpDir.empty())
+                 {
+@@ -376,7 +569,15 @@ int main(int argc, char** argv)
+     {
+         ShaderRecompiler recompiler;
+         size_t fileSize;
+-        recompiler.recompile(readAllBytes(input, fileSize).get(), include);
++        auto fileData = readAllBytes(input, fileSize);
++        if (isContainer0E(fileData.get(), fileSize))
++        {
++            const uint32_t size = readBe32(fileData.get() + 4) + readBe32(fileData.get() + 8);
++            std::vector<uint8_t> up = upgradeContainer0E(fileData.get(), size);
++            recompiler.recompile(up.data(), include);
++        }
++        else
++            recompiler.recompile(fileData.get(), include);
+         writeAllBytes(output, recompiler.out.data(), recompiler.out.size());
+     }
+ 

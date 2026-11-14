@@ -1,0 +1,981 @@
+# svr07 high-frame-rate stage 1 (reports/L7-fps-stage1.md): tick carry for the 11 functions that truncate the
+# frame-rate block's step (0x8295D1A4 +0x30) with int(step). Each hook sits right after the function's only
+# `lfs f0,48(rN)` of the block; the next use of f0 is the fctiwz/fctidz. The hook (src/svr07_fps.cpp,
+# Svr07FpsCarry) replaces f0 with this frame's carried whole step (0,1,0,1 at 0.5) only while the step is under 1.0
+# and svr07_fps_tick_carry is on; otherwise f0 is left as loaded (the game's own int()). Per site, so no other
+# function or thread sees a changed block. Addresses counted from the generated code (checked against every
+# loc_/ctx.lr anchor in each function).
+
+[[midasm_hook]]
+address = 0x8222EE90
+name = "Svr07FpsCarry_8222EDE0"
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x8222F77C
+name = "Svr07FpsCarry_8222F6B8"
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x82261A68
+name = "Svr07FpsCarry_82261A58"
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x8232FF48
+name = "Svr07FpsCarry_8232FF30"
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x824B1784
+name = "Svr07FpsCarry_824B1760"
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x824B2BD0
+name = "Svr07FpsCarry_824B2BA8"
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x824BBDAC
+name = "Svr07FpsCarry_824BBCE0"
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x824C09F0
+name = "Svr07FpsCarry_824C09D8"
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x8250B4F0
+name = "Svr07FpsCarry_8250B360"
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x8250D718
+name = "Svr07FpsCarry_8250D470"
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x82514368
+name = "Svr07FpsCarry_825142B8"
+registers = ["f0"]
+after_instruction = true
+
+# L10 (reports/L10-fps-entrance-end.md): the entrance/camera event clock (camera object +192) on whole ticks below
+# step 1.0. src/svr07_fps.cpp swaps f0 (the loaded step) for this frame's carried whole step (0/1) while
+# svr07_fps_event_carry is on and the step is under 1.0; otherwise f0 stays as loaded.
+# sub_8225E490 odd-tick path: lfs f0,48(r24) ; fadds f0,f0,f13 ; stfs f0,0(r26)  (t += step, script not run)
+[[midasm_hook]]
+address = 0x8225E6B4
+name = "Svr07FpsEvtOdd"
+registers = ["f0", "r31"]
+after_instruction = true
+
+# Part trigger windows: fire when key <= t < key + step (lfs f0,48 ; fadds f0,key,f0 ; fcmpu t,f0).
+[[midasm_hook]]
+address = 0x824BFF18
+name = "Svr07FpsEvtWin_824BFEA8"
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x824C0090
+name = "Svr07FpsEvtWin_824C0028"
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x824C017C
+name = "Svr07FpsEvtWin_824C0100"
+registers = ["f0"]
+after_instruction = true
+
+# L10 corrected cause: the cut-end latch in sub_824A9390 (`if (t + step >= end) this[32] = 1`, then
+# sub_824C1180 starts the next cut). A step that grows between frames lets the camera script run out first.
+# Svr07FpsCutLookahead raises f0 (the step) to max(step, 1.0) below 1.0 / step + 0.5 above it while
+# svr07_fps_cut_lookahead is on and our writer sets the step; f0 stays as loaded at step 1.0.
+[[midasm_hook]]
+address = 0x824A93C8
+name = "Svr07FpsCutLookahead"
+registers = ["f0"]
+after_instruction = true
+
+# L17 (reports/L17-fps-scene-gating.md): the two 30 Hz players (script index while int(clock) is even). Below
+# step 1.0 while our writer sets the step and svr07_hfps_script_fix is on, the odd-tick `fadds f0,f0,1.0` adds the
+# step instead (f0 = result - 1.0 + step), so an index lasts 2 ticks as at 60, not 1 tick + 1 frame.
+# sub_82254570 (parts motion): fadds f0,f0,f31 (f31 = 1.0) on its three non-PAL skip paths.
+[[midasm_hook]]
+address = 0x82254668
+name = "Svr07FpsOddStep_82254668"
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x8225468C
+name = "Svr07FpsOddStep_8225468C"
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x82254900
+name = "Svr07FpsOddStep_82254900"
+registers = ["f0"]
+after_instruction = true
+
+# sub_8225C7C8 (motion player): odd tick `fadds f0,f0,f24` (f24 = 1.0) at 0x8225CBCC.
+[[midasm_hook]]
+address = 0x8225CBCC
+name = "Svr07FpsOddStep_8225CBCC"
+registers = ["f0"]
+after_instruction = true
+
+# sub_8225C7C8 event flag of the frame data r3 (fires the 'S4AT' vcall +20: sounds, impacts): r10 = byte & 0x80
+# (0x8225CB18) or byte < 32 in mode 1 (0x8225CB2C). Svr07FpsMotionEvt clears r10 when the same frame data
+# came back on the previous frame (its events already ran), so each index fires once.
+[[midasm_hook]]
+address = 0x8225CB18
+name = "Svr07FpsMotionEvt_8225CB18"
+registers = ["r10", "r3", "r31"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x8225CB2C
+name = "Svr07FpsMotionEvt_8225CB2C"
+registers = ["r10", "r3", "r31"]
+after_instruction = true
+
+# L18 (reports/L18-fps-frame-tied-scan.md): per-frame counters / increments in the live match. High-fps live
+# match only (our writer below step 1.0, src/svr07_fps.cpp): integer counters move by the whole 60 Hz ticks of this
+# frame (0 or 1 at 240) instead of 1; float increments are multiplied by the step. Each group has a cvar.
+# REV: wrestler +608 frames since LT/RT press (reversal window, 1 s lockout, LT+RT 5-frame window)
+[[midasm_hook]]
+address = 0x820FB0C4
+name = "Svr07Tick_820FB0C4"
+registers = ["r11"]
+after_instruction = true
+# REV: wrestler +920 counter-move input window (state COPE)
+[[midasm_hook]]
+address = 0x820E9038
+name = "Svr07Tick_820E9038"
+registers = ["r11"]
+after_instruction = true
+# CLK: global 0x829489C8 match elapsed frames (clock, time limit)
+[[midasm_hook]]
+address = 0x8219D350
+name = "Svr07Tick_8219D350"
+registers = ["r11"]
+after_instruction = true
+# REF: referee pin count frames (+92; count = (+92+80)/90)
+[[midasm_hook]]
+address = 0x821A33BC
+name = "Svr07Tick_821A33BC"
+registers = ["r11"]
+after_instruction = true
+# AI: AI action elapsed frames +52 (timeout rate*15)
+[[midasm_hook]]
+address = 0x82185DF0
+name = "Svr07Tick_82185DF0"
+registers = ["r11"]
+after_instruction = true
+# AI: AI action counter +56 (thresholds like 10; CPU reversal cooldown at 82189B24)
+[[midasm_hook]]
+address = 0x8218806C
+name = "Svr07Tick_8218806C"
+registers = ["r11"]
+after_instruction = true
+# AI: AI action counter +56 (thresholds like 10; CPU reversal cooldown at 82189B24)
+[[midasm_hook]]
+address = 0x82188228
+name = "Svr07Tick_82188228"
+registers = ["r11"]
+after_instruction = true
+# AI: AI action counter +56 (thresholds like 10; CPU reversal cooldown at 82189B24)
+[[midasm_hook]]
+address = 0x8218843C
+name = "Svr07Tick_8218843C"
+registers = ["r11"]
+after_instruction = true
+# AI: AI action counter +56 (thresholds like 10; CPU reversal cooldown at 82189B24)
+[[midasm_hook]]
+address = 0x82188644
+name = "Svr07Tick_82188644"
+registers = ["r11"]
+after_instruction = true
+# AI: AI action counter +56 (thresholds like 10; CPU reversal cooldown at 82189B24)
+[[midasm_hook]]
+address = 0x82188790
+name = "Svr07Tick_82188790"
+registers = ["r9"]
+after_instruction = true
+# AI: AI action counter +56 (thresholds like 10; CPU reversal cooldown at 82189B24)
+[[midasm_hook]]
+address = 0x82188C70
+name = "Svr07Tick_82188C70"
+registers = ["r11"]
+after_instruction = true
+# AI: AI action counter +56 (thresholds like 10; CPU reversal cooldown at 82189B24)
+[[midasm_hook]]
+address = 0x82188F10
+name = "Svr07Tick_82188F10"
+registers = ["r11"]
+after_instruction = true
+# AI: AI action counter +56 (thresholds like 10; CPU reversal cooldown at 82189B24)
+[[midasm_hook]]
+address = 0x821890D4
+name = "Svr07Tick_821890D4"
+registers = ["r11"]
+after_instruction = true
+# AI: AI action counter +56 (thresholds like 10; CPU reversal cooldown at 82189B24)
+[[midasm_hook]]
+address = 0x82189404
+name = "Svr07Tick_82189404"
+registers = ["r11"]
+after_instruction = true
+# AI: AI action counter +56 (thresholds like 10; CPU reversal cooldown at 82189B24)
+[[midasm_hook]]
+address = 0x8218959C
+name = "Svr07Tick_8218959C"
+registers = ["r11"]
+after_instruction = true
+# AI: AI action counter +56 (thresholds like 10; CPU reversal cooldown at 82189B24)
+[[midasm_hook]]
+address = 0x821897F8
+name = "Svr07Tick_821897F8"
+registers = ["r11"]
+after_instruction = true
+# AI: AI action counter +56 (thresholds like 10; CPU reversal cooldown at 82189B24)
+[[midasm_hook]]
+address = 0x82189B24
+name = "Svr07Tick_82189B24"
+registers = ["r11"]
+after_instruction = true
+# AI: AI action counter +56 (thresholds like 10; CPU reversal cooldown at 82189B24)
+[[midasm_hook]]
+address = 0x82189D40
+name = "Svr07Tick_82189D40"
+registers = ["r11"]
+after_instruction = true
+# AI: AI action counter +56 (thresholds like 10; CPU reversal cooldown at 82189B24)
+[[midasm_hook]]
+address = 0x8218A5F0
+name = "Svr07Tick_8218A5F0"
+registers = ["r11"]
+after_instruction = true
+# AI: CPU brain decision countdown +44 (every 5 frames)
+[[midasm_hook]]
+address = 0x82136A8C
+name = "Svr07Tick_82136A8C"
+registers = ["r11"]
+# AI: CPU brain rescan countdown +48 (120)
+[[midasm_hook]]
+address = 0x8213BA50
+name = "Svr07Tick_8213BA50"
+registers = ["r11"]
+# AI: CPU tactic countdown +49 (byte)
+[[midasm_hook]]
+address = 0x8213B1DC
+name = "Svr07Tick_8213B1DC"
+registers = ["r11"]
+after_instruction = true
+# AI: CPU tactic mode duration +38 (short)
+[[midasm_hook]]
+address = 0x8213B210
+name = "Svr07Tick_8213B210"
+registers = ["r11"]
+after_instruction = true
+# AI: CPU random mode-2 duration +51 (byte)
+[[midasm_hook]]
+address = 0x8213B3A0
+name = "Svr07Tick_8213B3A0"
+registers = ["r11"]
+after_instruction = true
+# AI: CPU tactic countdown +49 in mode 3 (byte)
+[[midasm_hook]]
+address = 0x8213897C
+name = "Svr07Tick_8213897C"
+registers = ["r11"]
+after_instruction = true
+# STR: hold task +48 frames (>300 ends the hold; &7 mash ring slot)
+[[midasm_hook]]
+address = 0x821048AC
+name = "Svr07Tick_821048AC"
+registers = ["r11"]
+after_instruction = true
+# STR: submission +120 frames since start (90/390 phase windows)
+[[midasm_hook]]
+address = 0x82114D88
+name = "Svr07Tick_82114D88"
+registers = ["r11"]
+after_instruction = true
+# STR: submission minigame +132 frames since start (90/390)
+[[midasm_hook]]
+address = 0x821165E0
+name = "Svr07Tick_821165E0"
+registers = ["r11"]
+after_instruction = true
+# STR: submission tug meter +112 -1 per frame
+[[midasm_hook]]
+address = 0x82115100
+name = "Svr07Tick_82115100"
+registers = ["r11"]
+# STR: submission tug meter +112 +1 per frame
+[[midasm_hook]]
+address = 0x821151CC
+name = "Svr07Tick_821151CC"
+registers = ["r11"]
+after_instruction = true
+# STR: submission mistimed-press lockout +108 (60 frames)
+[[midasm_hook]]
+address = 0x821169EC
+name = "Svr07Tick_821169EC"
+registers = ["r11"]
+after_instruction = true
+# STA: wrestler +564 special/finisher window (600 frames)
+[[midasm_hook]]
+address = 0x820FA920
+name = "Svr07Tick_820FA920"
+registers = ["r10"]
+after_instruction = true
+# STA: wrestler +582 input buffer window (15 frames, byte)
+[[midasm_hook]]
+address = 0x820E738C
+name = "Svr07Tick_820E738C"
+registers = ["r11"]
+after_instruction = true
+# STA: wrestler +884 short special-input lockout
+[[midasm_hook]]
+address = 0x820FA434
+name = "Svr07Tick_820FA434"
+registers = ["r11"]
+after_instruction = true
+# STA: task +36 frames (>120 ends: partner reaction watch)
+[[midasm_hook]]
+address = 0x82104138
+name = "Svr07Tick_82104138"
+registers = ["r11"]
+after_instruction = true
+# STA: task +32 frames (>=30 -> move 234)
+[[midasm_hook]]
+address = 0x82105038
+name = "Svr07Tick_82105038"
+registers = ["r11"]
+after_instruction = true
+# STA: task +32 frames (phases at ==60)
+[[midasm_hook]]
+address = 0x82105874
+name = "Svr07Tick_82105874"
+registers = ["r11"]
+after_instruction = true
+# STA: button hold frames +76 (>=10, states 800/810/900)
+[[midasm_hook]]
+address = 0x8211025C
+name = "Svr07Tick_8211025C"
+registers = ["r11"]
+after_instruction = true
+# STA: body-part damage regen +40
+[[midasm_hook]]
+address = 0x8210F148
+name = "Svr07Tick_8210F148"
+registers = ["r10"]
+after_instruction = true
+# STA: body-part damage regen +42
+[[midasm_hook]]
+address = 0x8210F178
+name = "Svr07Tick_8210F178"
+registers = ["r10"]
+after_instruction = true
+# STA: body-part damage regen +44
+[[midasm_hook]]
+address = 0x8210F1A8
+name = "Svr07Tick_8210F1A8"
+registers = ["r10"]
+after_instruction = true
+# STA: body-part damage regen +46
+[[midasm_hook]]
+address = 0x8210F1D8
+name = "Svr07Tick_8210F1D8"
+registers = ["r11"]
+after_instruction = true
+# PHY: fall arc gravity 0.22 per frame
+[[midasm_hook]]
+address = 0x820EC098
+name = "Svr07Tick_820EC098"
+registers = ["f0"]
+after_instruction = true
+# PHY: fall arc x += vx
+[[midasm_hook]]
+address = 0x820EC0A8
+name = "Svr07Tick_820EC0A8"
+registers = ["f0"]
+after_instruction = true
+# PHY: fall arc y += vy
+[[midasm_hook]]
+address = 0x820EC0B8
+name = "Svr07Tick_820EC0B8"
+registers = ["f0"]
+after_instruction = true
+# PHY: fall arc z += vz
+[[midasm_hook]]
+address = 0x820EC0C8
+name = "Svr07Tick_820EC0C8"
+registers = ["f0"]
+after_instruction = true
+# PHY: dive (moves 1556-1565) x += vx
+[[midasm_hook]]
+address = 0x82101DA0
+name = "Svr07Tick_82101DA0"
+registers = ["f0"]
+after_instruction = true
+# PHY: dive z += vz
+[[midasm_hook]]
+address = 0x82101DB4
+name = "Svr07Tick_82101DB4"
+registers = ["f13"]
+after_instruction = true
+# PHY: dive gravity 0.22
+[[midasm_hook]]
+address = 0x82101DB8
+name = "Svr07Tick_82101DB8"
+registers = ["f0"]
+after_instruction = true
+# SND: SFXE +1568 delayed reaction sound (30 frames)
+[[midasm_hook]]
+address = 0x823E1114
+name = "Svr07Tick_823E1114"
+registers = ["r11"]
+# SND: SFXE +1580 delayed sound (30 frames)
+[[midasm_hook]]
+address = 0x823E1168
+name = "Svr07Tick_823E1168"
+registers = ["r11"]
+# SND: crowd base-cheer crossfade countdown (360 frames)
+[[midasm_hook]]
+address = 0x823E6D00
+name = "Svr07Tick_823E6D00"
+registers = ["r11"]
+# SND: crowd crossfade volume delta (1/360 per frame)
+[[midasm_hook]]
+address = 0x823E6D58
+name = "Svr07Tick_823E6D58"
+registers = ["f13"]
+after_instruction = true
+# SND: stream fade countdown +60
+[[midasm_hook]]
+address = 0x823E6710
+name = "Svr07Tick_823E6710"
+registers = ["r11"]
+# SND: stream fade volume delta +64
+[[midasm_hook]]
+address = 0x823E6778
+name = "Svr07Tick_823E6778"
+registers = ["f13"]
+after_instruction = true
+# SND: ring announcer duck fade 0.016 per frame (in)
+[[midasm_hook]]
+address = 0x823E3130
+name = "Svr07Tick_823E3130"
+registers = ["f0"]
+after_instruction = true
+# SND: ring announcer duck fade 0.016 per frame (out)
+[[midasm_hook]]
+address = 0x823E3208
+name = "Svr07Tick_823E3208"
+registers = ["f0"]
+after_instruction = true
+# L18: the third 30 Hz player sub_822677E0 (object/prop/crowd-type motion player, component vtable 0x82026228,
+# created by sub_82266778 from sub_82195520 / sub_82196CE8 / sub_82197848 / sub_823460F0): event flag r10 = frame
+# byte & 0x80 of frame data r31 (owner component r28), before `cmplwi cr6,r10,0`. Svr07FpsObjEvt clears r10 when
+# the same frame data came back on the previous frame (each index's events once, not 4x at 240).
+[[midasm_hook]]
+address = 0x822679D8
+name = "Svr07FpsObjEvt_822679D8"
+registers = ["r10", "r31", "r28"]
+# L18 STR: sub_821147C0 `subf. r11,r11,r30` = frame counter r30 % 60 (hardcoded 60): a pulse (sub_82114128) once a
+# second per 60 frames = 4x a second at 240. Svr07FpsSubPulse (before the subf.) makes the result 0 once per 60 ticks.
+[[midasm_hook]]
+address = 0x82114868
+name = "Svr07FpsSubPulse_82114868"
+registers = ["r11", "r30"]
+
+# L19 (reports/L19-fps-frame-tied-2.md): the rest of L18's frame-tied list, same gating (live match, our writer below
+# step 1.0, one cvar per group; src/svr07_fps.cpp). Ints by whole ticks, floats x step, exponential smoothing
+# k' = 1-(1-k)^step. "Guard" hooks clear an equality result on 0-tick frames, so a one-shot test on a counter that is
+# held for the whole tick fires once per value, not on every frame of the tick.
+# CUE: wrestler +900 "recently X" timer (counts to 6000/200; readers test == 1)
+[[midasm_hook]]
+address = 0x820FA44C
+name = "Svr07Tick_820FA44C"
+registers = ["r11"]
+after_instruction = true
+
+# CUE: wrestler +946 "recently X" timer (counts to 6000/200; readers test == 1)
+[[midasm_hook]]
+address = 0x820FA46C
+name = "Svr07Tick_820FA46C"
+registers = ["r11"]
+after_instruction = true
+
+# CUE: wrestler +952 "recently X" timer (counts to 6000/200; readers test == 1)
+[[midasm_hook]]
+address = 0x820FA490
+name = "Svr07Tick_820FA490"
+registers = ["r11"]
+after_instruction = true
+
+# CUE: wrestler +953 "recently X" timer (counts to 6000/200; readers test == 1)
+[[midasm_hook]]
+address = 0x820FA4B4
+name = "Svr07Tick_820FA4B4"
+registers = ["r11"]
+after_instruction = true
+
+# CARRY: sub_820EE588 stick/speed block once per tick: 0-tick frame and not moving -> the counters (820EEAB4)
+[[midasm_hook]]
+address = 0x820EE6D4
+name = "Svr07Carry_820EE6D4"
+registers = ["r31"]
+jump_address_on_true = 0x820EEAB4
+
+# CARRY: 0-tick frame while moving -> skip the stick/speed update, keep the position add (820EE8D4)
+[[midasm_hook]]
+address = 0x820EE6D8
+name = "Svr07Carry_820EE6D8"
+registers = ["r31"]
+jump_address_on_true = 0x820EE8D4
+
+# CARRY: forward move per frame (f31 = c * speed) x step
+[[midasm_hook]]
+address = 0x820EE928
+name = "Svr07Tick_820EE928"
+registers = ["f31"]
+after_instruction = true
+
+# CARRY: task +52 frames (== 2*rate in sub_820ECDB8)
+[[midasm_hook]]
+address = 0x820EEAC0
+name = "Svr07Tick_820EEAC0"
+registers = ["r10"]
+after_instruction = true
+
+# CARRY: task +36 frames (/ rate > 15)
+[[midasm_hook]]
+address = 0x820EEAC4
+name = "Svr07Tick_820EEAC4"
+registers = ["r11"]
+after_instruction = true
+
+# CARRY: sub_820ECDB8 rule "+52 == 2*rate" only on tick frames (the value is held for the whole tick)
+[[midasm_hook]]
+address = 0x820ED384
+name = "Svr07Carry_820ED384"
+registers = ["r11"]
+after_instruction = true
+
+# TURN: sub_820F41B0 turn-to-face frame counter +36 (vs +40)
+[[midasm_hook]]
+address = 0x820F41F0
+name = "Svr07Tick_820F41F0"
+registers = ["r11"]
+after_instruction = true
+
+# TURN: max turn per frame pi/+40 x step (sub_82412BA8 is a linear approach with snap)
+[[midasm_hook]]
+address = 0x820F4210
+name = "Svr07Tick_820F4210"
+registers = ["f2"]
+after_instruction = true
+
+# SPIN: sub_820FD408 state 250: +-0.02 rad per frame (f29, set on all three paths) x step
+[[midasm_hook]]
+address = 0x820FD720
+name = "Svr07Tick_820FD720"
+registers = ["f29"]
+
+# CAM: sub_8214E2B8 match camera mode ramp, global ramp +step x step
+[[midasm_hook]]
+address = 0x8214E504
+name = "Svr07Tick_8214E504"
+registers = ["f13"]
+after_instruction = true
+
+# CAM: sub_8214E2B8 match camera mode ramp, global ramp -step x step
+[[midasm_hook]]
+address = 0x8214E510
+name = "Svr07Tick_8214E510"
+registers = ["f13"]
+after_instruction = true
+
+# CAM: sub_8214E2B8 match camera mode ramp, +164 step and snap distance x step
+[[midasm_hook]]
+address = 0x8214E598
+name = "Svr07Tick_8214E598"
+registers = ["f12"]
+after_instruction = true
+
+# CAM: sub_8214E2B8 match camera mode ramp, +164 -step x step
+[[midasm_hook]]
+address = 0x8214E5AC
+name = "Svr07Tick_8214E5AC"
+registers = ["f13"]
+after_instruction = true
+
+# CAM: sub_8214E2B8 match camera mode ramp, +712 step and snap distance x step
+[[midasm_hook]]
+address = 0x8214E5E8
+name = "Svr07Tick_8214E5E8"
+registers = ["f12"]
+after_instruction = true
+
+# CAM: sub_8214E2B8 match camera mode ramp, +712 -step x step
+[[midasm_hook]]
+address = 0x8214E5FC
+name = "Svr07Tick_8214E5FC"
+registers = ["f13"]
+after_instruction = true
+
+# FOLLOW: sub_82194548 follow point +64 += (+48 - +64) * k (k 0.2 / 0.5): k' = 1-(1-k)^step
+[[midasm_hook]]
+address = 0x8219472C
+name = "Svr07Tick_8219472C"
+registers = ["f0"]
+
+# IK: sub_8225AB08 limb offset fade counter +4 (9 / 3 / n frames)
+[[midasm_hook]]
+address = 0x8225B318
+name = "Svr07Tick_8225B318"
+registers = ["r11"]
+after_instruction = true
+
+# KEY: sub_822635B8 blend time +32 += 1.0 -> += step
+[[midasm_hook]]
+address = 0x82263624
+name = "Svr07Tick_82263624"
+registers = ["f13"]
+after_instruction = true
+
+# KEY: sub_822635B8 blend time +36 += 1.0 -> += step
+[[midasm_hook]]
+address = 0x82263868
+name = "Svr07Tick_82263868"
+registers = ["f0"]
+after_instruction = true
+
+# ITEM: sub_822E0858 animation time += rate (+21076) x step
+[[midasm_hook]]
+address = 0x822E0EB0
+name = "Svr07Tick_822E0EB0"
+registers = ["f12"]
+after_instruction = true
+
+# LADDER: sub_82199CF0 sway phase counter +44
+[[midasm_hook]]
+address = 0x82199D44
+name = "Svr07Tick_82199D44"
+registers = ["r10"]
+after_instruction = true
+
+# LADDER: sub_82198F28 sin phase (+44 << 9) + tick fraction (smooth at 240)
+[[midasm_hook]]
+address = 0x82198F68
+name = "Svr07Ladder_82198F68"
+registers = ["r11"]
+after_instruction = true
+
+# LADDER: cos phase (+44 << 8) + tick fraction
+[[midasm_hook]]
+address = 0x82198F8C
+name = "Svr07Ladder_82198F8C"
+registers = ["r11"]
+after_instruction = true
+
+# FADE: sub_8218E020 delay +44
+[[midasm_hook]]
+address = 0x8218E02C
+name = "Svr07Tick_8218E02C"
+registers = ["r11"]
+after_instruction = true
+
+# FADE: sub_8218E020 fade delta +40 x step
+[[midasm_hook]]
+address = 0x8218E03C
+name = "Svr07Tick_8218E03C"
+registers = ["f0"]
+after_instruction = true
+
+# FADE: sub_8218EC58 delay +56
+[[midasm_hook]]
+address = 0x8218EC64
+name = "Svr07Tick_8218EC64"
+registers = ["r11"]
+after_instruction = true
+
+# FADE: sub_8218EC58 fade frame +48 (alpha = 128 * +48 / +52)
+[[midasm_hook]]
+address = 0x8218EC74
+name = "Svr07Tick_8218EC74"
+registers = ["r11"]
+after_instruction = true
+
+# FADE: sub_8218EC58 "+48 == 1" one-shot flags: tick frames only
+[[midasm_hook]]
+address = 0x8218EC78
+name = "Svr07Guard_8218EC78"
+registers = ["cr6"]
+after_instruction = true
+
+# FADE: sub_8218E6A0 frame +32 (alpha 128 - n, placement at == 128, end at 256)
+[[midasm_hook]]
+address = 0x8218E6C4
+name = "Svr07Tick_8218E6C4"
+registers = ["r10"]
+after_instruction = true
+
+# FADE: sub_8218E6A0 "+32 == 128" one-shot (placement, global table index++): tick frames only
+[[midasm_hook]]
+address = 0x8218E778
+name = "Svr07Guard_8218E778"
+registers = ["cr6"]
+after_instruction = true
+
+# BONE: sub_82192EE8 move 15121 bone03 rotate step +52 (1..5)
+[[midasm_hook]]
+address = 0x82192F3C
+name = "Svr07Tick_82192F3C"
+registers = ["r10"]
+after_instruction = true
+
+# FX: sub_82125D78 lifetime +56 -= 4 per frame (before addic.: -4 per tick)
+[[midasm_hook]]
+address = 0x82125D8C
+name = "Svr07Fx_82125D8C"
+registers = ["r11"]
+
+# FX: sub_82125D78 v += c, p += v; exact over a step h: v += c*h, p += h*v + c*h(h+1)/2
+[[midasm_hook]]
+address = 0x82125D90
+name = "Svr07Fx_82125D90"
+registers = ["f0", "f12", "f13", "r3"]
+after_instruction = true
+
+# SHAKE: sub_820E0540 timer / damping / offset tail once per tick (children still update every frame)
+[[midasm_hook]]
+address = 0x820E05E0
+name = "Svr07Shake_820E05E0"
+registers = ["r31"]
+jump_address_on_true = 0x820E0738
+
+# PAD: sub_8210FD30 press history shift (+38 <- +36, +36 <- +40): presses 1 / 2 ticks ago, not frames
+[[midasm_hook]]
+address = 0x8210FD8C
+name = "Svr07PadHist_8210FD8C"
+registers = ["r11", "r10", "r30"]
+
+# PAD: this frame's new presses (+40) recorded with the tick position
+[[midasm_hook]]
+address = 0x8211001C
+name = "Svr07PadHist_8211001C"
+registers = ["r10", "r30"]
+after_instruction = true
+
+# L19 risk fixes for L18's own counters: a counter held for a whole tick meets a one-shot equality test.
+# CLK guard: clock & 63 == 0 (per wrestler, sub_820FA3C0)
+[[midasm_hook]]
+address = 0x820FA80C
+name = "Svr07Guard_820FA80C"
+registers = ["cr6"]
+after_instruction = true
+
+# CLK guard: clock % (30*rate) == 0 -> crowd sound 9302
+[[midasm_hook]]
+address = 0x823E51C4
+name = "Svr07Guard_823E51C4"
+registers = ["cr0"]
+after_instruction = true
+
+# CLK guard: clock % (rate*60) == 0 -> crowd sound 9310
+[[midasm_hook]]
+address = 0x823E5218
+name = "Svr07Guard_823E5218"
+registers = ["cr0"]
+after_instruction = true
+
+# CLK guard: clock == 180
+[[midasm_hook]]
+address = 0x823E5AF0
+name = "Svr07Guard_823E5AF0"
+registers = ["cr6"]
+after_instruction = true
+
+# STA guard: sub_82105858 task +32 == 1 -> sound 4455
+[[midasm_hook]]
+address = 0x82105900
+name = "Svr07Guard_82105900"
+registers = ["cr6"]
+after_instruction = true
+
+# ---- L20 (reports/L20-fps-move-cameras.md): camera scripts in the live match ----
+# CAM: sub_8225E490 even path, right after `bl sub_82257DF8` (t += step): a repeat of last frame's script index
+# (same player r31, index r28, frame data r30) goes to the function's "processed" exit (+1172 = 0, return 1)
+[[midasm_hook]]
+address = 0x8225E64C
+name = "Svr07CamRepeat_8225E64C"
+registers = ["r21", "r27", "r28", "r30", "r31"]
+jump_address_on_true = 0x8225E80C
+
+# CAM: sub_8225D9C8 FOV smoothing, after `fsubs f13,f11,f12` (f0 = k): k' = 1-(1-k)^step
+[[midasm_hook]]
+address = 0x8225DA2C
+name = "Svr07CamFov_8225DA2C"
+registers = ["f0"]
+after_instruction = true
+
+# FLASH: sub_82264E28 camera-flash emitter, before `cmpwi cr6,r11,0` (r11 = duration): 0-tick frame -> epilogue
+[[midasm_hook]]
+address = 0x82264E7C
+name = "Svr07CamFlash_82264E7C"
+registers = ["r11"]
+jump_address_on_true = 0x82265350
+
+# FLASH: sub_82264BA0 flash light +10884 -1 per frame (lit) / cooldown
+[[midasm_hook]]
+address = 0x82264C04
+name = "Svr07Tick_82264C04"
+registers = ["r11"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x82264D6C
+name = "Svr07Tick_82264D6C"
+registers = ["r11"]
+after_instruction = true
+
+# FLASH: sub_822641E8 flash object age +32 += 1 (ends at life + 1)
+[[midasm_hook]]
+address = 0x822641FC
+name = "Svr07Tick_822641FC"
+registers = ["r11"]
+after_instruction = true
+
+# ---- L22 (reports/L22-fps-anim-clocks.md): model material time clocks (g_fTime) ----
+# sub_8242E958: t (+12 of each 20-byte material entry) += obj+216 (1.0) per call. After each `lfs f0,216(r31)`: f0 x step
+[[midasm_hook]]
+address = 0x8242E9D4
+name = "Svr07AnimClock_8242E9D4"
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x8242EA04
+name = "Svr07AnimClock_8242EA04"
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x8242EA34
+name = "Svr07AnimClock_8242EA34"
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x8242EA64
+name = "Svr07AnimClock_8242EA64"
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x8242EABC
+name = "Svr07AnimClock_8242EABC"
+registers = ["f0"]
+after_instruction = true
+
+# ---- L23 (reports/L23-fps-menus-full-rate.md): menus / 2D UI at full rate (svr07_hfps_fix_menu_anims) ----
+# sub_82422750 2D layout keyframe player: after `lfs f12,84(r30)` (speed): f12 x step (t += speed at 0x82422DBC, end and
+# done tests use the same f12)
+[[midasm_hook]]
+address = 0x82422DB4
+name = "Svr07MenuAnim_82422DB4"
+registers = ["f12"]
+after_instruction = true
+
+# sub_82272E70 layout transition counter: after `divwu r8,r9,r11` (r8 = 60 / rate = 1 per frame): r8 = whole 60 Hz ticks
+[[midasm_hook]]
+address = 0x82272ED8
+name = "Svr07MenuTick_82272ED8"
+registers = ["r8"]
+after_instruction = true
+
+# ---- L24 (reports/L24-fps-entrances.md): entrances at the full rate ----
+# sub_822541A0 face / finger pose blend clocks (component vtable 0x82025D28): rate-60 path `fadds f0,f0,f31` (f31 = 1.0)
+# in both 30-entry loops. After it: f0 = f0 - 1.0 + step (svr07_hfps_fix_parts_clock; the PAL path adds the step itself)
+[[midasm_hook]]
+address = 0x8225421C
+name = "Svr07PartsClock_8225421C"
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x82254344
+name = "Svr07PartsClock_82254344"
+registers = ["f0"]
+after_instruction = true
+
+# sub_824B7150 entrance rope player: before `bl sub_824B6F10` (script pass): a 0-tick frame with the player active goes
+# straight to the apply part 0x824B72D8 (svr07_hfps_fix_entrance_rope)
+[[midasm_hook]]
+address = 0x824B71A4
+name = "Svr07EntRope_824B71A4"
+registers = ["r31"]
+jump_address_on_true = 0x824B72D8
+
+# ---- L25 (reports/L25-fps-ropes-fades.md): ropes (REX_HOOK_RAW sub_821260A0), screen fades, state waits ----
+# sub_822526D8 full-screen colour fade, mode 0: the three counter adds (n == len: +1, n == len + 1: +2, lerp: +1) count
+# whole 60 Hz ticks (svr07_hfps_fix_screen_fade)
+[[midasm_hook]]
+address = 0x8225272C
+name = "Svr07Fade_8225272C"
+registers = ["r11"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x8225274C
+name = "Svr07Fade_8225274C"
+registers = ["r11"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x822528B8
+name = "Svr07Fade_822528B8"
+registers = ["r11"]
+after_instruction = true
+
+# sub_82252488 (mode 1): delay +88 `addi r11,r11,-1` counts ticks (the blend is the sub_82251FC8 hook, lr 0x822524B8)
+[[midasm_hook]]
+address = 0x822526B0
+name = "Svr07Fade_822526B0"
+registers = ["r11"]
+after_instruction = true
+
+# sub_824A0758 I/O state machine: time +0x1918D4 `addi r9,r9,1` and delay +32 `addi r11,r10,-1` count ticks
+# (svr07_hfps_fix_state_wait)
+[[midasm_hook]]
+address = 0x824A076C
+name = "Svr07StateWait_824A076C"
+registers = ["r9"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x824A0778
+name = "Svr07StateWait_824A0778"
+registers = ["r11"]
+after_instruction = true

@@ -1,0 +1,34 @@
+RR-NR-6 (nr6b): plume prints why a PSO fails (first 24 failures, hr + desc) to stderr. Applied after UFC's plume patches.
+diff --git a/plume_d3d12.cpp b/plume_d3d12.cpp
+--- a/plume_d3d12.cpp
++++ b/plume_d3d12.cpp
+@@ -1,3 +1,4 @@
++#include <atomic>
+ //
+ // plume
+ //
+@@ -3236,7 +3237,23 @@
+ 
+         psoDesc.InputLayout = { inputElements.data(), UINT(inputElements.size()) };
+ 
+-        device->d3d->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&d3d));
++        const HRESULT psoResult = device->d3d->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&d3d));
++        // RR-NR-6 diagnostics: why a PSO fails (first 24 failures, to stderr = native_stderr.txt).
++        if (FAILED(psoResult)) {
++            static std::atomic<uint32_t> s_failures{0};
++            if (s_failures.fetch_add(1) < 24) {
++                auto magic = [](const D3D12_SHADER_BYTECODE &b) -> uint32_t { uint32_t m = 0; if (b.pShaderBytecode && b.BytecodeLength >= 4) memcpy(&m, b.pShaderBytecode, 4); return m; };
++                fprintf(stderr, "plume: CreateGraphicsPipelineState failed hr=0x%08X vs %zu bytes magic %08X ps %zu bytes magic %08X rts %u fmt0 %d dsv %d inputs %u samples %u root %p\n",
++                    unsigned(psoResult), size_t(psoDesc.VS.BytecodeLength), magic(psoDesc.VS), size_t(psoDesc.PS.BytecodeLength), magic(psoDesc.PS),
++                    unsigned(psoDesc.NumRenderTargets), int(psoDesc.RTVFormats[0]), int(psoDesc.DSVFormat), unsigned(psoDesc.InputLayout.NumElements),
++                    unsigned(psoDesc.SampleDesc.Count), (void *)psoDesc.pRootSignature);
++                for (UINT e = 0; e < psoDesc.InputLayout.NumElements; e++) {
++                    const auto &el = psoDesc.InputLayout.pInputElementDescs[e];
++                    fprintf(stderr, "plume:   input %u %s%u fmt %d slot %u off %u\n", unsigned(e), el.SemanticName, unsigned(el.SemanticIndex), int(el.Format), unsigned(el.InputSlot), unsigned(el.AlignedByteOffset));
++                }
++                fflush(stderr);
++            }
++        }
+     }
+ 
+     D3D12GraphicsPipeline::~D3D12GraphicsPipeline() {
