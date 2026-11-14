@@ -54,7 +54,7 @@ Extras are set up the first time the game asks for one: the base superstar's rec
 
 A pac of their own would need a line in `plist360.h`, and:
 
-- UE 2.5 already lists **192 pac files, the most the game's file system is set up for**
+- A full roster mod already lists **192 pac files, the most the game's file system is set up for**
   (`sub_821C4D18` asks `sub_8241D310` for 192 entries of 32 bytes). A 193rd crashed the boot.
 - The SDK's mods overlay can't open files it *adds* (only ones it replaces): see "SDK bug".
 
@@ -153,7 +153,7 @@ Cvar `roster_extras` (default on) turns it all off.
 
 ## Status (2026-10-18)
 
-Test: `testrun-roster`, UE 2.5 files and a copy of the save, one extra ("Edge Clone",
+Test: `testrun-roster`, a full roster mod and a copy of the save, one extra ("Edge Clone",
 Edge's model and stats, id 167, a Jericho render as its picture).
 
 | step | result |
@@ -167,8 +167,8 @@ Edge's model and stats, id 167, a Jericho render as its picture).
 
 Problems found and fixed on the way:
 
-1. UE 2.5 is at the 192-pac limit: a new pac crashed the boot -> models go into ch92.pac.
-2. The select screen's list is full with UE 2.5 + 30 CAWs (123/123) -> list moved to our block.
+1. A full roster mod is at the 192-pac limit: a new pac crashed the boot -> models go into ch92.pac.
+2. The select screen's list is full with a full roster mod + 30 CAWs (123/123) -> list moved to our block.
 3. Model numbers >= 10000 are CAWs: Edge Clone was loaded as CAW slot 67 (`/ED156/...` miss,
    endless NOW LOADING) -> model-number hooks.
 4. The overlay couldn't open an added file (Disc Read Error) -> ch92.pac instead.

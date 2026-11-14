@@ -424,7 +424,7 @@ std::map<std::string, uint32_t> ReadSlots(const fs::path& p) {
 }  // namespace
 
 // The extras' model entries go into a copy of pac\ch\ch92.pac (with its own entries)
-// laid over the game's. A pac of their own would need a plist360.h line, and UE 2.5
+// laid over the game's. A pac of their own would need a plist360.h line, and a large roster mod
 // already lists the 192 pac files the game's file system is set up for (sub_821C4D18 ->
 // sub_8241D310); entries are found by name through plist360.arc, so any listed pac can
 // hold them (FixPacIndexes rebuilds the index for the merged file).
@@ -669,7 +669,7 @@ namespace R = svr07::roster;
 // from block+16, one loop per brand/mode, `for (id = 0; id < limit; ++id)` with limit 93
 // or 123, and returns the count. Its callers clear a block of 2460 bytes in their object
 // (123 entries) and hand it and the count to the select grid (sub_82301EF0 keeps them at
-// +72 / +76). With the UE 2.5 roster plus 30 CAWs all 123 are used.
+// +72 / +76). With a full modded roster plus 30 CAWs all 123 are used.
 //
 // So the list is built in a bigger block of ours (kSelectEntries), the first 123 entries
 // are copied back for anything that reads the caller's block, and the grid gets ours.

@@ -738,7 +738,7 @@ void BuildPortraitPacs(const fs::path& game_root, const fs::path& mods, const fs
 // pac's own table: for each pac in plist360.h, in order, a marker (ff 00 00 00 for the
 // first, ff <index> ff ff after) and a big-endian copy of the pac's EPAC table, group
 // records stored as (entries * 3) << 20 | file id; then ff ff ff ff. A mod that moves
-// entries without updating it makes the game read the wrong bytes: the UE 2.5 mod grew four
+// entries without updating it makes the game read the wrong bytes: a large roster mod grew four
 // loading screens in menuHD.pac, so LOAD/S006..S031 were read from stale offsets (empty
 // picture set -> null track array -> crash on the first NOW LOADING screen). Merged pacs
 // (above) move entries too. So the index is rebuilt from the pacs the game will really

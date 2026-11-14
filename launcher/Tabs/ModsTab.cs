@@ -15,7 +15,7 @@ public class ModsTab : ILauncherTab
     {
         var col = Ui.Column();
         col.Controls.Add(Ui.Head("Mod packs"));
-        col.Controls.Add(Ui.Text("Every folder in mods\\ is a pack (the Ultimate pack, the UE 2.5 pack...). Select one and press Use; only one pack is active at a time. " +
+        col.Controls.Add(Ui.Text("Every folder in mods\\ is a mod pack. Select one and press Use; only one pack is active at a time. " +
             "Choose \"(none)\" to play the plain retail game."));
         col.Controls.Add(list);
         var row = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, BackColor = Theme.Bg };

@@ -30,6 +30,6 @@ pictures when it starts (a few seconds the first time, then cached in your user 
 ## Mods installed into the game folder
 
 Some 360 mods move entries inside the game's `.pac` files without updating `plist360.arc`, the index
-the game uses to find them (the Ultimate Edition 2.5 mod does this, which crashed the game on the
+the game uses to find them (large roster mods do this, which crashed the game on the
 first loading screen). The recomp checks the index at startup and uses a corrected copy when it
 is out of date, so these mods work without any change to your files.
